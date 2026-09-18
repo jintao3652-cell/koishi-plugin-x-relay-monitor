@@ -1,0 +1,17 @@
+{
+  "name": "koishi-plugin-x-relay-monitor",
+  "description": "Monitor whitelisted X accounts and your own Discord relay channel, translate via OpenAI-compatible API, and push original + translation to whitelisted groups.",
+  "version": "1.0.0",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "license": "MIT",
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "twitter",
+    "translator"
+  ],
+  "peerDependencies": {
+    "koishi": "4.18.11"
+  }
+}
