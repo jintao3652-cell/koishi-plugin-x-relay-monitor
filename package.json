@@ -11,6 +11,9 @@
     "twitter",
     "translator"
   ],
+  "dependencies": {
+    "rettiwt-api": "^7.1.3"
+  },
   "peerDependencies": {
     "koishi": "4.18.11"
   }
