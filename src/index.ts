@@ -22,6 +22,12 @@ export interface Config {
   xEnabled: boolean
   intervalMinutes: number
   requestTimeout: number
+  // 是否附带推文卡片图（默认本地渲染，完全不访问 x.com，不会被 Cloudflare 拦截）
+  screenshotEnabled: boolean
+  // 是否改为打开 x.com 推文页截图（官方原版画面；可能被「正在进行安全验证」拦截，失败自动回退本地渲染）
+  xPageScreenshot: boolean
+  // HTTP 直取主页失败时是否回退浏览器（x.com 对自动化环境常弹人机验证，默认关闭）
+  xBrowserFallback: boolean
   excludeRetweets: boolean
   includeFilter: string
   excludeFilter: string
@@ -31,6 +37,10 @@ export interface Config {
   maxTweets: number
   useOriginalImages: boolean
   realGif: boolean
+  // 媒体下载失败时的重试次数（网络抖动时自动重试）
+  mediaDownloadRetries: number
+  // 媒体下载专用代理（仅下载走代理，需启用 proxy-agent 插件；留空直连）
+  mediaProxyAgent: string
   imageSendMode: 'buffer' | 'url' | 'base64' | 'file'
   videoSendMode: 'buffer' | 'url' | 'base64' | 'file'
   // rsshub 模式
@@ -39,10 +49,15 @@ export interface Config {
   // Discord 登录
   discordEnabled: boolean
   dcAppId: string
+  // DC 兜底轮询间隔（秒）；实时消息走 Discord 网关事件即时转发
+  dcIntervalSeconds: number
+  // DC 实时转发的翻译等待上限（毫秒）：超时先发原文，避免 AI 慢拖累转发
+  dcTranslateBudgetMs: number
   // OpenAI 翻译
   openaiApiKey: string
   openaiBaseURL: string
   openaiModel: string
+  openaiFallbackModels: string[]
   systemPrompt: string
   // 推送
   linkStyle: 'original' | 'fxtwitter' | 'vxtwitter'
@@ -129,7 +144,7 @@ function buildConfigSchema(): Schema<Config> {
   return Schema.intersect([
   // ============ 主设置 ============
   Schema.object({
-    intervalMinutes: Schema.number().min(1).max(1440).step(1).default(10).description('轮询间隔（分钟，X 账号与 DC 频道共用）'),
+    intervalMinutes: Schema.number().min(1).max(1440).step(1).default(10).description('X 账号轮询间隔（分钟；DC 频道有独立的兜底轮询，不再受此间隔影响）'),
     requestTimeout: Schema.number().min(5000).max(120000).step(1000).default(30000).description('单次请求超时（毫秒）'),
     enableLog: Schema.boolean().default(true).description('输出详细日志'),
     watermarkText: Schema.string().default('本消息由3090的机器人发出').description('推送图片水印文字'),
@@ -167,10 +182,20 @@ function buildConfigSchema(): Schema<Config> {
       .description('Rettiwt API_KEY（获取方法：F12 打开开发者工具 → 应用程序 → Cookie，复制 auth_token、ct0、twid 三个字段的值，在控制台执行 btoa("auth_token=<值>;ct0=<值>;twid=<值>;")，输出的字符串即为 API_KEY。也可直接粘贴原始 cookie 串 auth_token=..;ct0=..;twid=..;，插件会自动转换为 base64，升级后无需手动更新配置'),
     includeQuote: Schema.boolean().default(false).description('附带引用推文内容'),
     maxTweets: Schema.number().min(1).max(20).step(1).default(5).description('每次检查的最新推文条数（Rettiwt 上限 20）'),
+    screenshotEnabled: Schema.boolean().default(true)
+      .description('推送时附带推文卡片图（默认在本地渲染，完全不访问 x.com，因此不会出现 Cloudflare「正在进行安全验证」；关闭后只发文本卡片与媒体，速度更快）'),
+    xPageScreenshot: Schema.boolean().default(false)
+      .description('推文卡片改为「打开 x.com 推文页截图」（画面是官方原版，与网页一致）。注意：x.com 会对自动化访问弹「正在进行安全验证」，被拦截时自动回退本地渲染，且拦截后有 10 分钟冷却期不再尝试'),
+    xBrowserFallback: Schema.boolean().default(false)
+      .description('HTTP 直取主页失败时回退到浏览器抓取（默认关闭：x.com 对自动化环境经常弹人机验证，回退多半白等 20~30 秒）'),
     useOriginalImages: Schema.boolean().default(false)
       .description('启用原图后会把 pbs.twimg.com/media 图片地址改为 name=orig'),
     realGif: Schema.boolean().default(false)
       .description('可将 Twitter 动图从 MP4 转为真正的 GIF，需启用 koishi-plugin-ffmpeg 服务'),
+    mediaDownloadRetries: Schema.number().min(1).max(5).step(1).default(3)
+      .description('媒体下载失败时的重试次数（网络抖动时自动重试，并在重试间轮换 CDN 地址；默认 3）'),
+    mediaProxyAgent: Schema.string().default('')
+      .description('媒体下载专用代理（如 http://127.0.0.1:7897）。留空则直连；填写前请先启用「代理服务 (proxy-agent)」插件'),
     imageSendMode: Schema.union([
       Schema.const('buffer').description('下载后以 buffer 发送'),
       Schema.const('url').description('直接传递 URL'),
@@ -193,6 +218,10 @@ function buildConfigSchema(): Schema<Config> {
     discordEnabled: Schema.boolean().default(true).description('启用 Discord（通过 DC 机器人定时读取推送板块内配置的频道内容）'),
     dcAppId: Schema.string().default('')
       .description('基础设置：指定 DC 机器人 APP ID（Discord 应用程序 ID / 机器人账号 ID）。存在多个 Discord 机器人时，本插件固定使用该机器人读取频道与去重，避免与其他插件（如 DC-QQ 桥接）的机器人冲突。留空则自动选择'),
+    dcIntervalSeconds: Schema.number().min(5).max(600).step(1).default(10)
+      .description('DC 频道兜底轮询间隔（秒）。实时消息由 Discord 网关事件立即转发（不等轮询）；此轮询只用于补收机器人离线 / 事件漏收期间的消息，默认 10 秒'),
+    dcTranslateBudgetMs: Schema.number().min(1000).max(120000).step(1000).default(15000)
+      .description('DC 实时转发的翻译等待上限（毫秒）：AI 超过这个时间还没返回就先发原文（译文留空），避免翻译通道慢导致转发延迟过大。X 推文推送不受此限制'),
     dcLog: Schema.boolean().default(true).description('输出 DC 频道读取日志（总开关：主设置 → 输出详细日志）'),
   }).description('DC 登录'),
   // ============ XP 推送 ============
@@ -216,6 +245,9 @@ function buildConfigSchema(): Schema<Config> {
     openaiApiKey: Schema.string().role('secret').default('').description('OpenAI API Key（留空则只发原文）'),
     openaiBaseURL: Schema.string().default('https://api.openai.com/v1').description('API Base URL（兼容 Chat Completions）'),
     openaiModel: buildModelSchema().description('模型名（配置 API KEY 与地址后自动在线获取，下拉选择；也可手动输入）'),
+    openaiFallbackModels: Schema.array(Schema.string().description('模型名'))
+      .default([])
+      .description('备用模型（按顺序回退）：主模型返回 5xx / 429 / 超时 / 空内容时自动改用备用模型，全部失败才放弃翻译；留空则只用主模型'),
     systemPrompt: Schema.string().default('你是专业模拟飞行领域翻译。将用户内容准确翻译为简体中文，保留专有名词、呼号、机场代码与数字，只输出译文，不要附加说明。保留原文中的 Markdown 格式（如 **粗体**、# 标题、列表、- 项目、引用 >、行内代码 ` 与链接 [文字](url)），译文沿用相同 Markdown 语法。').description('翻译系统提示词'),
     aiLog: Schema.boolean().default(true).description('输出 AI 翻译日志（总开关：主设置 → 输出详细日志）'),
   }).description('AI 翻译设置'),
@@ -239,10 +271,16 @@ export function apply(ctx: Context, config: Config) {
   // 生命周期与去重状态
   const timers = new Map<string, NodeJS.Timeout>()
   let disposed = false
-  let polling = false
+  // X 轮询与 DC 兜底轮询使用独立的重入锁（两者互不阻塞）
+  let xPolling = false
+  let dcPolling = false
   const discordSeen = new Set<string>()
   const lastIds: Record<string, string> = {}
   const lastMessageIds: Record<string, string> = {}
+  // 已推送过的推文 ID（持久化）：即使水位线因镜像解析失败倒退、或插件重启后状态陈旧，
+  // 同一条推文也不会被二次推送到群里。超出上限按先进先出淘汰。
+  const pushedTweetIds = new Set<string>()
+  const PUSHED_IDS_LIMIT = 800
 
   function log(level: 'info' | 'warn' | 'error', message: string, ...args: any[]) {
     if (level === 'info' && !config.enableLog) return
@@ -298,13 +336,22 @@ export function apply(ctx: Context, config: Config) {
       if (state?.lastIds) Object.assign(lastIds, state.lastIds)
       if (state?.lastMessageIds) Object.assign(lastMessageIds, state.lastMessageIds)
       if (Array.isArray(state?.discordSeen)) state.discordSeen.forEach((id: string) => discordSeen.add(id))
+      if (Array.isArray(state?.pushedTweetIds)) state.pushedTweetIds.forEach((id: string) => pushedTweetIds.add(id))
     } catch { /* 首次运行无状态文件 */ }
   }
 
+  // X 轮询与 DC 实时转发可能同时触发状态写入：串行化写盘，避免并发写文件互相截断
+  let stateSaveQueue: Promise<void> = Promise.resolve()
+
   async function saveState() {
-    await fs.mkdir(path.dirname(dataFile), { recursive: true })
-    const seen = [...discordSeen].slice(-200)
-    await fs.writeFile(dataFile, JSON.stringify({ lastIds, lastMessageIds, discordSeen: seen }, null, 2))
+    const job = stateSaveQueue.then(async () => {
+      await fs.mkdir(path.dirname(dataFile), { recursive: true })
+      const seen = [...discordSeen].slice(-200)
+      const pushed = [...pushedTweetIds].slice(-PUSHED_IDS_LIMIT)
+      await fs.writeFile(dataFile, JSON.stringify({ lastIds, lastMessageIds, discordSeen: seen, pushedTweetIds: pushed }, null, 2))
+    })
+    stateSaveQueue = job.catch(() => {})
+    await job
   }
 
   // ---------------- 工具函数 ----------------
@@ -431,8 +478,68 @@ export function apply(ctx: Context, config: Config) {
     return [...ids]
   }
 
+  // ---------------- AI 翻译通道 ----------------
+  // 中转站（happyapi 等）的翻译接口会偶发 500 / 503 / 超时 / 空内容：
+  // 单模型一次失败就把译文丢掉太浪费，这里按「主模型 → 备用模型」链式回退；
+  // 全部失败后短暂熔断，避免每条消息都白等一次 60s 超时（还会连带链接文字再等一次）。
+
+  // 单次翻译调用的总时间预算（含重试与换模型）
+  const AI_TOTAL_BUDGET = 180000
+  // 单次请求的最小超时：推理模型首包慢，按配置的 30s 容易误杀
+  const AI_MIN_ATTEMPT_TIMEOUT = 60000
+  // 熔断冷却时间
+  const AI_COOLDOWN = 90000
+  // 后台翻译结局日志的耗时门槛：短于该值说明请求其实很快、只是赶不上 DC 等待上限，不值得记
+  const BUDGET_LOG_THRESHOLD = 20000
+
+  let aiCooldownUntil = 0
+
+  function aiReady(): boolean {
+    return Date.now() >= aiCooldownUntil
+  }
+
+  function aiCooldown(reason: string) {
+    aiCooldownUntil = Date.now() + AI_COOLDOWN
+    ailog('warn', `AI 翻译通道暂停 ${Math.round(AI_COOLDOWN / 1000)}s（${reason}）`)
+  }
+
+  // 主模型 + 备用模型（去空去重）
+  function modelChain(): string[] {
+    const list = [config.openaiModel, ...(config.openaiFallbackModels || [])]
+      .map(model => String(model || '').trim())
+      .filter(Boolean)
+    return [...new Set(list)]
+  }
+
+  function statusOf(error: any): number | undefined {
+    const status = error?.response?.status ?? error?.status
+    return typeof status === 'number' ? status : undefined
+  }
+
+  // 接口返回体：new-api / one-api 系中转站的 5xx、403 都会把真实原因放在 body 里
+  // （如「当前分组上游负载已饱和」「该令牌无权访问模型 xxx」），必须解出来才能判断该不该换模型
+  function errorBodyText(error: any): string {
+    const body = error?.response?.data
+    if (body == null) return ''
+    if (typeof body === 'string') return body
+    if (Buffer.isBuffer(body)) return body.toString('utf8')
+    if (body instanceof ArrayBuffer) return Buffer.from(body).toString('utf8')
+    try { return JSON.stringify(body) } catch { return '' }
+  }
+
+  // 整条链都没必要继续的错误。注意 403 不能一律视为鉴权失败：
+  // 中转站对「令牌无权访问该模型」也返回 403，这种情况换备用模型仍然能翻译成功。
+  function fatalError(error: any): boolean {
+    const status = statusOf(error)
+    if (status === 401) return true
+    if (status !== 403) return false
+    const text = errorBodyText(error)
+    return /invalid[^"]{0,20}(token|api[-_ ]?key)|令牌无效|无效的令牌|未提供令牌|no auth|unauthorized/i.test(text)
+  }
+
   // cordis-http 的 "fetch ... failed" 会把真实原因（超时/DNS/连接重置等）
-  // 藏在 error.cause 里，直接展示 message 无法定位问题。
+  // 藏在 error.cause 里，直接展示 message 无法定位问题；
+  // 5xx 时接口返回体（限流 / 余额 / 审核 / 上游报错）往往才是关键，一并带上。
   function describeHttpError(error: any): string {
     const message = String(error?.message || error || 'unknown error')
     const parts = [message]
@@ -442,47 +549,145 @@ export function apply(ctx: Context, config: Config) {
       const causeMessage = String(cause?.message || cause)
       if (causeMessage && causeMessage !== message && !message.includes(causeMessage)) parts.push(causeMessage)
     }
-    const status = error?.response?.status ?? error?.status
+    const status = statusOf(error)
     if (status && !parts.some(p => p.includes(String(status)))) parts.push(`HTTP ${status}`)
-    return parts.filter(Boolean).join(' ').slice(0, 300)
+    const body = errorBodyText(error).replace(/\s+/g, ' ').trim()
+    // 别把纯文本的 statusText 重复拼一遍
+    if (body && !parts.some(p => p.includes(body.slice(0, 40)))) parts.push(`body: ${body}`)
+    return parts.filter(Boolean).join(' ').slice(0, 400)
   }
 
-  // OpenAI 标准格式 chat/completions 调用；瞬时网络失败自动重试一次，
-  // 4xx（鉴权/参数问题）不重试。最终抛出的错误带根因描述。
-  async function postChatCompletion(body: Record<string, any>): Promise<any> {
+  // 兼容少数中转站的特殊返回：content 可能是分段数组、可能被包在代码块里，
+  // qwen 系还会把思考过程放在 <think>…</think> / ```think 中，一并剥掉
+  function pickContent(res: any): string | null {
+    const choice = res?.choices?.[0]
+    const raw = choice?.message?.content ?? choice?.delta?.content ?? choice?.text ?? res?.content ?? ''
+    let text = Array.isArray(raw)
+      ? raw.map((part: any) => (typeof part === 'string' ? part : String(part?.text ?? ''))).join('')
+      : String(raw ?? '')
+    text = text
+      .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '')
+      // 只剥「显式标注为思考过程」的代码块，普通 ``` 包裹的译文不能动
+      .replace(/^\s*```(?:think|reasoning)\b[\s\S]*?```\s*/i, '')
+      .trim()
+    return text || null
+  }
+
+  // 单次 chat/completions 请求；只负责一次收发，重试与换模型在 requestChat 里做
+  async function postChatCompletion(model: string, messages: any[], timeout: number): Promise<string | null> {
     const url = `${config.openaiBaseURL.replace(/\/$/, '')}/chat/completions`
+    const res: any = await ctx.http.post(url, { model, messages, temperature: 0.3 }, {
+      headers: {
+        Authorization: `Bearer ${config.openaiApiKey}`,
+        'Content-Type': 'application/json',
+      },
+      timeout,
+    })
+    return pickContent(res)
+  }
+
+  // 按模型链请求：主模型失败立刻切备用模型（比在同一条上游上死等更快），
+  // 链尾模型多试一次兜底；401（或 403 且确为令牌无效）直接终止整条链。
+  async function requestChat(messages: any[]): Promise<string> {
+    const models = modelChain()
+    if (!models.length) throw new Error('未配置翻译模型')
+    const deadline = Date.now() + AI_TOTAL_BUDGET
+    const attemptTimeout = Math.max(config.requestTimeout, AI_MIN_ATTEMPT_TIMEOUT)
     let lastError: any
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        return await ctx.http.post(url, body, {
-          headers: { Authorization: `Bearer ${config.openaiApiKey}` },
-          timeout: Math.max(config.requestTimeout, 60000),
-        })
-      } catch (error: any) {
-        lastError = error
-        const status = error?.response?.status ?? error?.status
-        if (status && status < 500 && status !== 429) break
-        if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 1500))
+    for (let index = 0; index < models.length; index++) {
+      const model = models[index]
+      const isLast = index === models.length - 1
+      const attempts = isLast ? 2 : 1
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        const remaining = deadline - Date.now()
+        if (remaining < 5000) {
+          throw new Error(`${describeHttpError(lastError)}（已用尽 ${Math.round(AI_TOTAL_BUDGET / 1000)}s 总重试预算）`)
+        }
+        try {
+          const content = await postChatCompletion(model, messages, Math.min(attemptTimeout, remaining))
+          if (content) return content
+          lastError = new Error(`模型 ${model} 返回空内容`)
+        } catch (error: any) {
+          lastError = error
+          if (fatalError(error)) throw new Error(describeHttpError(error))
+        }
+        if (attempt < attempts) await new Promise(resolve => setTimeout(resolve, 2000 * attempt))
+      }
+      if (!isLast) {
+        ailog('warn', `模型 ${model} 翻译失败（${describeHttpError(lastError)}），改用备用模型 ${models[index + 1]}`)
       }
     }
     throw new Error(describeHttpError(lastError))
   }
 
-  async function translate(text: string): Promise<string | null> {
+  // 已是中文的内容不再送 AI 翻译：省掉一次最慢的请求（DC 中文公告、中文推文都走这条捷径）
+  function isMostlyChinese(text: string): boolean {
+    const value = String(text || '')
+    const cjk = (value.match(/[\u4e00-\u9fff]/g) || []).length
+    if (cjk < 8) return false
+    const latin = (value.match(/[A-Za-z]/g) || []).length
+    return cjk >= latin * 0.6
+  }
+
+  // budgetMs > 0 时给翻译加「等待上限」：超时立即返回 null（先发原文），
+  // 后台那次请求继续跑完但结果丢弃 —— 避免 AI 通道慢时整条推送被拖住数分钟。
+  async function translate(text: string, budgetMs?: number): Promise<string | null> {
     if (!config.openaiApiKey) return null
+    if (!String(text || '').trim()) return null
+    if (isMostlyChinese(text)) {
+      ailog('info', '内容已是中文，跳过 AI 翻译')
+      return null
+    }
+    if (!aiReady()) {
+      const seconds = Math.max(1, Math.round((aiCooldownUntil - Date.now()) / 1000))
+      ailog('info', `AI 翻译通道冷却中，本条跳过翻译（${seconds}s 后恢复）`)
+      return null
+    }
+    const job = requestChat([
+      { role: 'system', content: config.systemPrompt },
+      { role: 'user', content: text },
+    ])
+    // 加了等待上限后，超时那一次请求仍会在后台跑完。这里记录它的最终结局：
+    // 否则超时告警后无法区分「模型慢但最终成功」还是「网关/模型彻底挂了」，排查没有抓手。
+    const jobStartedAt = Date.now()
+    job.then(
+      (content: string | null) => {
+        if (Date.now() - jobStartedAt > BUDGET_LOG_THRESHOLD) {
+          ailog('info', `超时后后台翻译才完成（总耗时 ${Math.round((Date.now() - jobStartedAt) / 1000)}s），结果已丢弃`)
+        }
+        return content
+      },
+      (error: any) => {
+        if (Date.now() - jobStartedAt > BUDGET_LOG_THRESHOLD) {
+          ailog('warn', `超时后后台翻译也失败了（${error?.message || error}）`)
+        }
+      },
+    )
     try {
-      const res: any = await postChatCompletion({
-        model: config.openaiModel,
-        messages: [
-          { role: 'system', content: config.systemPrompt },
-          { role: 'user', content: text },
-        ],
-        temperature: 0.3,
-      })
-      const content = res?.choices?.[0]?.message?.content?.trim()
-      return content || null
+      let content: string | null
+      if (budgetMs && budgetMs > 0) {
+        const timeout = Symbol('timeout')
+        const raced = await Promise.race([
+          job,
+          new Promise<typeof timeout>(resolve => setTimeout(() => resolve(timeout), budgetMs)),
+        ])
+        if (raced === timeout) {
+          ailog('warn', `翻译超过 ${Math.round(budgetMs / 1000)}s 未返回，先发原文（译文本次留空）`)
+          return null
+        }
+        content = raced
+      } else {
+        content = await job
+      }
+      if (aiCooldownUntil) {
+        aiCooldownUntil = 0
+        ailog('info', 'AI 翻译通道已恢复')
+      }
+      return content
     } catch (error: any) {
-      ailog('warn', `翻译失败，仅发送原文: ${error?.message || error}`)
+      const reason = error?.message || String(error)
+      aiCooldown(reason)
+      ailog('warn', `翻译失败，仅发送原文: ${reason}`)
       return null
     }
   }
@@ -549,29 +754,166 @@ export function apply(ctx: Context, config: Config) {
     return false
   }
 
-  // 截图推文原文：优先只截推文卡片元素（article[data-testid="tweet"]，即 Post 详情页的推文本体，
-  // 不包含 X 侧边栏与下方推荐流）；找不到推文元素时回退整页截图。
-  // 推文自带图片/视频时（hideMedia），截图前移除媒体区域，只保留文本与头部部分。
-  async function captureTweetScreenshot(statusUrl: string, hideMedia = false): Promise<Buffer | null> {
-    // 使用 koishi-plugin-puppeteer 提供的服务 API
+  // 推文卡片图：**默认本地渲染**，完全不访问 x.com。
+  //
+  // 2026-10-24：历史问题——截图靠 Puppeteer 打开 x.com 推文页，X 会对自动化访问弹 Cloudflare
+  // 「正在进行安全验证」（早先还把配置里的 auth_token 注入浏览器，被判定为风险会话直接 302 到
+  // /account/access），于是转发出去的那张「推文截图」就是验证页本身。
+  // 现在主路径改为用 fxtwitter/vxtwitter 已解析到的正文、头像、图片在本地拼一张 X 风格的卡片，
+  // 不产生任何对 x.com 的请求 → 不可能再出现安全验证页，也不再受 CF 速率限制影响。
+  // 想保留官方原版画面时可在配置里打开 `xPageScreenshot`（那一路径仍带验证页识别 + 冷却）。
+  const X_BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36 Edg/155.0.0.0'
+
+  function looksLikeXVerification(url: string, title: string, body: string): boolean {
+    if (/\/account\/access|\/i\/flow\/login|\/login\b/i.test(String(url || ''))) return true
+    const text = `${title || ''}\n${body || ''}`
+    return [
+      '正在进行安全验证',
+      '本网站使用安全服务',
+      'Verify you are human',
+      'Just a moment',
+      'Attention Required',
+      'Checking your browser',
+    ].some(marker => text.includes(marker))
+  }
+
+  interface TweetShotMeta {
+    /** 显示名（推文作者名）；缺省用 @账号 */
+    author?: string
+    /** 账号名（不含 @） */
+    account: string
+    text: string
+    images?: string[]
+    avatarUrl?: string
+    pubDate?: string
+    link?: string
+  }
+
+  // 本地渲染推文卡片：头像 + 作者 + @账号 + 正文 + 图片网格（最多 4 张）
+  async function renderTweetCard(meta: TweetShotMeta): Promise<Buffer | null> {
     const puppeteer = ctx.puppeteer
     if (!puppeteer) {
-      plog('warn', 'puppeteer 服务未安装，无法截图推文，回退文本推送')
+      plog('warn', 'puppeteer 服务未安装，无法渲染推文卡片')
       return null
     }
-    const authToken = extractAuthToken(decodeAuthTokenCookie())
+    const esc = (value: string) => String(value || '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+    // 正文只做「转义 + 链接/提及高亮」，不解析 Markdown：X 的正文里 * _ # 都是字面量
+    const bodyHtml = esc(meta.text)
+      .replace(/(https?:\/\/[^\s<]+)/g, url => `<a href="${url}" target="_blank" rel="noopener">${url}</a>`)
+      .replace(/(^|[\s(])(@[A-Za-z0-9_]{1,15})/g, (_m, pre, mention) => `${pre}<a href="https://x.com/${mention.slice(1)}" target="_blank" rel="noopener">${mention}</a>`)
+    // 卡片里的缩略图用 name=small（≈680px）：原图（name=orig）单张 3~5MB，
+    // 四图卡片光下载就要十几秒，直接用大图只会拖慢推送
+    const cardImageUrl = (url: string): string => {
+      if (!/^https?:\/\/pbs\.twimg\.com\/media\//i.test(url)) return url
+      if (/[?&]name=[^&]+/i.test(url)) return url.replace(/([?&])name=[^&]+/i, '$1name=small')
+      return url + (url.includes('?') ? '&' : '?') + 'name=small'
+    }
+    const media = (meta.images || []).slice(0, 4).map(cardImageUrl)
+    const mediaClass = media.length === 1 ? 'one' : media.length === 2 ? 'two' : media.length === 3 ? 'three' : 'four'
+    const mediaHtml = media.length
+      ? `<div class="media ${mediaClass}">${media
+          .map(url => `<img src="${esc(url)}" onerror="this.style.display='none'">`).join('')}</div>`
+      : ''
+    const avatarHtml = meta.avatarUrl
+      ? `<img class="avatar" src="${esc(meta.avatarUrl)}" onerror="this.style.visibility='hidden'">`
+      : '<div class="avatar"></div>'
+    const html = `<!doctype html><html><head><meta charset="utf-8"><style>
+      body { margin:0; background:transparent; font-family:'Microsoft YaHei','PingFang SC',system-ui,sans-serif; }
+      #card { width:640px; box-sizing:border-box; background:#000; color:#e7e9ea; padding:18px 20px 14px; border-radius:16px; }
+      .head { display:flex; align-items:center; gap:12px; margin-bottom:12px; }
+      .avatar { width:48px; height:48px; border-radius:50%; object-fit:cover; background:#2f3336; flex:0 0 auto; }
+      .who { display:flex; flex-direction:column; line-height:1.3; }
+      .name { font-size:16px; font-weight:700; }
+      .handle { font-size:14px; color:#71767b; }
+      .body { font-size:17px; line-height:1.6; white-space:pre-wrap; word-break:break-word; }
+      .body a { color:#1d9bf0; text-decoration:none; }
+      .media { margin-top:12px; display:grid; gap:3px; border-radius:14px; overflow:hidden; }
+      .media.one { grid-template-columns:1fr; }
+      .media.two, .media.three, .media.four { grid-template-columns:1fr 1fr; }
+      .media img { width:100%; display:block; object-fit:cover; background:#0b0b0b; }
+      .media.one img { max-height:460px; object-fit:contain; }
+      .media.two img { aspect-ratio:4/3; }
+      .media.three img:first-child { grid-column:1 / -1; aspect-ratio:16/9; }
+      .media.three img, .media.four img { aspect-ratio:4/3; }
+      .foot { margin-top:12px; display:flex; align-items:center; justify-content:space-between; font-size:13px; color:#71767b; }
+      .foot .brand { font-size:17px; font-weight:700; color:#e7e9ea; }
+    </style></head><body><div id="card">
+      <div class="head">${avatarHtml}<div class="who"><span class="name">${esc(meta.author || `@${meta.account}`)}</span><span class="handle">@${esc(meta.account)}</span></div></div>
+      <div class="body">${bodyHtml}</div>
+      ${mediaHtml}
+      <div class="foot"><span>${esc(meta.pubDate || '')}</span><span class="brand">X</span></div>
+    </div></body></html>`
+    let page: any = null
+    try {
+      page = await puppeteer.page()
+      await page.setViewport({ width: 700, height: 900, deviceScaleFactor: 2 })
+      await page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 20000 })
+      // 等图片解码完成（外部图，最多 8s），避免卡片里出现空白图位
+      await page.evaluate(() => Promise.race([
+        Promise.all(Array.from(document.images).map((img: any) => img.complete
+          ? Promise.resolve()
+          : new Promise(resolve => { img.onload = resolve; img.onerror = resolve }))),
+        new Promise(resolve => setTimeout(resolve, 8000)),
+      ])).catch(() => {})
+      const card = await page.$('#card')
+      if (!card) return null
+      const buffer = await card.screenshot({ type: 'png' }) as Buffer
+      if (!buffer || buffer.length < 5000) {
+        plog('warn', '本地推文卡片过小，疑似渲染失败', undefined, undefined, { size: buffer?.length })
+        return null
+      }
+      plog('info', '推文卡片渲染完成（本地，未访问 x.com）', undefined, undefined, { size: buffer.length })
+      return buffer
+    } catch (error: any) {
+      plog('warn', `本地推文卡片渲染失败: ${error?.message || error}`)
+      return null
+    } finally {
+      if (page) await page.close().catch(() => {})
+    }
+  }
+
+  // 命中过 Cloudflare 验证页后，10 分钟内不再尝试官方页（否则每条推文都要白等一次跳转）
+  let xPageBlockedUntil = 0
+
+  // 官方原版画面：打开 x.com 推文页截推文卡片。可能被 CF 拦截，命中即进入冷却并返回 null。
+  async function captureTweetPageScreenshot(statusUrl: string, hideMedia = false): Promise<Buffer | null> {
+    if (Date.now() < xPageBlockedUntil) {
+      const left = Math.round((xPageBlockedUntil - Date.now()) / 1000)
+      plog('info', `x.com 官方页截图处于冷却期（剩余 ${left}s），本条直接用本地渲染`)
+      return null
+    }
+    const puppeteer = ctx.puppeteer
+    if (!puppeteer) return null
     let page: any = null
     try {
       page = await puppeteer.page()
       await page.setViewport({ width: 720, height: 900 })
-      if (authToken) {
-        await page.setCookie({ name: 'auth_token', value: authToken, domain: '.x.com', path: '/', httpOnly: true, secure: true }).catch(() => {})
-      }
+      // 不注入 auth_token / ct0：带登录 Cookie 的自动化会话会被判定为风险并 302 到 /account/access
+      await page.setUserAgent(X_BROWSER_UA)
+      await page.setExtraHTTPHeaders({ 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' })
       plog('info', `截图推文页面: ${statusUrl}`)
-      await page.goto(statusUrl, { waitUntil: 'networkidle2', timeout: Math.max(config.requestTimeout, 20000) })
+      await page.goto(statusUrl, { waitUntil: 'domcontentloaded', timeout: Math.max(config.requestTimeout, 20000) })
+      // X 已移除 article[data-testid="tweet"]（A/B 后为普通 <article>），用 article 作为推文本体
+      const article = await page.waitForSelector('article', { timeout: 12000 }).catch(() => null)
+      const probe: any = await page.evaluate(() => ({
+        url: location.href,
+        title: document.title,
+        text: (document.body?.innerText || '').slice(0, 400),
+        challenge: !!document.querySelector('iframe[src*="challenges.cloudflare.com"], #challenge-stage, #cf-challenge-running, .cf-turnstile'),
+      })).catch(() => null)
+      if (probe && (probe.challenge || looksLikeXVerification(probe.url, probe.title, probe.text))) {
+        xPageBlockedUntil = Date.now() + 10 * 60 * 1000
+        plog('warn', `x.com 官方页被 Cloudflare 安全验证拦截（${probe?.url || statusUrl}），10 分钟内改用本地渲染`)
+        return null
+      }
+      if (!article) return null
+      // 等推文里的图片加载完成（最多 4s），否则截出来的卡片会缺图
+      await page.waitForNetworkIdle({ idleTime: 400, timeout: 4000 }).catch(() => {})
       // 推文自带图片/视频时，截图前移除页面中的媒体区域，只保留文本与头部部分
       if (hideMedia) {
         await page.evaluate(() => {
+          const root = document.querySelector('article') || document
           const selectors = [
             'img[src*="pbs.twimg.com/media"]',
             'img[src*="ton.twimg.com"]',
@@ -579,41 +921,40 @@ export function apply(ctx: Context, config: Config) {
             '[data-testid="tweetPhoto"]',
             '[data-testid="videoPlayer"]',
             '[data-testid="gifPlayable"]',
+            '[data-testid="card.layoutLarge.media"]',
           ]
           for (const sel of selectors) {
-            document.querySelectorAll(sel).forEach(el => el.remove())
+            root.querySelectorAll(sel).forEach(el => el.remove())
           }
         }).catch(() => {})
-        await new Promise(res => setTimeout(res, 300))
+        await new Promise(res => setTimeout(res, 200))
       }
       // 只截推文卡片元素（Post 详情页本体），避免截到侧边栏与推荐内容
-      const article = await page.waitForSelector('article[data-testid="tweet"]', { timeout: 15000 }).catch(() => null)
-      if (article) {
-        await new Promise(res => setTimeout(res, 800))
-        const screenshot = await article.screenshot({ type: 'png' }) as Buffer
-        if (screenshot.length >= 5000) {
-          plog('info', '推文截图完成（仅推文卡片）', undefined, undefined, { size: screenshot.length })
-          return screenshot
-        }
-        plog('warn', '推文卡片截图过小，回退整页截图', undefined, undefined, { size: screenshot.length })
-      } else {
-        plog('warn', '未找到推文卡片元素，回退整页截图')
-      }
-      // 回退：整页截图
-      await new Promise(res => setTimeout(res, 1500))
-      const screenshot = await page.screenshot({ type: 'png', fullPage: true }) as Buffer
-      if (screenshot.length < 5000) {
-        plog('warn', '推文截图过小，疑似空白页面，回退文本推送', undefined, undefined, { size: screenshot.length })
+      const screenshot = await article.screenshot({ type: 'png' }) as Buffer
+      if (!screenshot || screenshot.length < 5000) {
+        plog('warn', '推文截图过小，疑似空白页面', undefined, undefined, { size: screenshot?.length })
         return null
       }
-      plog('info', '推文截图完成（整页）', undefined, undefined, { size: screenshot.length })
+      plog('info', '推文截图完成（x.com 官方页，仅推文卡片）', undefined, undefined, { size: screenshot.length })
       return screenshot
     } catch (error: any) {
-      plog('warn', `推文截图失败，回退文本推送: ${error?.message || error}`)
+      plog('warn', `推文页面截图失败: ${error?.message || error}`)
       return null
     } finally {
       if (page) await page.close().catch((error: any) => plog('warn', `关闭截图页面失败: ${error?.message || error}`))
     }
+  }
+
+  // 推文卡片入口：本地渲染为默认，官方页截图需显式开启且失败时自动回退本地渲染
+  async function captureTweetScreenshot(statusUrl: string, meta: TweetShotMeta): Promise<Buffer | null> {
+    if (config.screenshotEnabled === false) return null
+    // DC 中转（link 为空）或非推文链接不渲染
+    if (!/^https?:\/\/[^/]*(?:x|twitter)\.com\/[^/]+\/status\/\d+/i.test(statusUrl)) return null
+    if (config.xPageScreenshot) {
+      const shot = await captureTweetPageScreenshot(statusUrl)
+      if (shot) return shot
+    }
+    return renderTweetCard(meta)
   }
 
   // 原图策略：pbs.twimg.com/media 图片地址改为 name=orig
@@ -624,18 +965,58 @@ export function apply(ctx: Context, config: Config) {
     return url + (url.includes('?') ? '&' : '?') + 'name=orig'
   }
 
-  async function downloadMedia(url: string): Promise<Buffer | null> {
-    try {
-      const res = await ctx.http.get(url, {
-        responseType: 'arraybuffer',
-        timeout: Math.max(config.requestTimeout, 30000),
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Koishi/4.18' },
-      })
-      return Buffer.from(res as ArrayBuffer)
-    } catch (error: any) {
-      plog('warn', `媒体下载失败: ${url} ${error?.message || error}`)
-      return null
+  // 同一媒体在 CDN 上通常有多个等价入口：某个域名 / 参数组合瞬时不可达时，
+  // 重试可换用其它入口，避免一次网络抖动就丢掉图片。
+  function mediaUrlCandidates(url: string): string[] {
+    const list = [url]
+    const push = (u: string) => {
+      if (u && !list.includes(u)) list.push(u)
     }
+    // Twitter 图片：name=orig 失败时退到 large；仍失败则去掉 name 让 CDN 返回默认尺寸
+    if (/^https?:\/\/pbs\.twimg\.com\/media\//i.test(url)) {
+      const hasName = /[?&]name=[^&]*/.test(url)
+      push(url.replace(/([?&])name=[^&]*/, '$1name=large'))
+      push((hasName ? url.replace(/([?&])name=[^&]*/, '$1') : url).replace(/[?&]$/, ''))
+    }
+    // Discord 附件：cdn.discordapp.com 与 media.discordapp.net 是同一资源的两套入口
+    if (/^https?:\/\/cdn\.discordapp\.com\//i.test(url)) {
+      push(url.replace(/^https?:\/\/cdn\.discordapp\.com\//i, 'https://media.discordapp.net/'))
+    } else if (/^https?:\/\/media\.discordapp\.net\//i.test(url)) {
+      push(url.replace(/^https?:\/\/media\.discordapp\.net\//i, 'https://cdn.discordapp.com/'))
+    }
+    return list
+  }
+
+  async function downloadMedia(url: string): Promise<Buffer | null> {
+    const candidates = mediaUrlCandidates(url)
+    const attempts = Math.max(1, Math.min(5, Math.floor(Number(config.mediaDownloadRetries) || 3)))
+    const proxyAgent = String(config.mediaProxyAgent || '').trim() || undefined
+    let lastError: any
+    for (let i = 0; i < attempts; i++) {
+      // 每次重试轮换候选地址（次数超过候选数后沿用最后一个）
+      const target = candidates[Math.min(i, candidates.length - 1)]
+      try {
+        const options: any = {
+          responseType: 'arraybuffer',
+          timeout: Math.max(config.requestTimeout, 30000),
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Koishi/4.18',
+            'Referer': 'https://x.com/',
+          },
+        }
+        if (proxyAgent) options.proxyAgent = proxyAgent
+        const res = await ctx.http.get(target, options)
+        const buffer = Buffer.from(res as ArrayBuffer)
+        if (!buffer.length) throw new Error('响应为空')
+        if (i > 0) plog('info', `媒体下载重试成功（第 ${i + 1} 次）: ${target}`)
+        return buffer
+      } catch (error: any) {
+        lastError = error
+        if (i < attempts - 1) await sleep(600 * (i + 1))
+      }
+    }
+    plog('warn', `媒体下载失败（已重试 ${attempts} 次）: ${url} ${lastError?.message || lastError}`)
+    return null
   }
 
   function mimeFromUrl(url: string, fallback: string): string {
@@ -668,7 +1049,11 @@ export function apply(ctx: Context, config: Config) {
     try {
       if (mode === 'url') return h.image(target)
       const buffer = await downloadMedia(target)
-      if (!buffer) return null
+      if (!buffer) {
+        // 重试仍失败时不再直接丢图：降级为 URL 直传，由协议端自行拉取（此路径无法加水印）
+        plog('info', `媒体下载失败，已降级为 URL 直传: ${target}`)
+        return h.image(target)
+      }
       const mime = mimeFromUrl(target, 'image/png')
       const marked = await addWatermark(buffer, mime)
       if (mode === 'buffer') return h.image(marked, mime)
@@ -687,7 +1072,11 @@ export function apply(ctx: Context, config: Config) {
     try {
       if (mode === 'url') return h.video(url)
       const buffer = await downloadMedia(url)
-      if (!buffer) return null
+      if (!buffer) {
+        // 重试仍失败时降级为 URL 直传，避免整段视频被丢弃
+        plog('info', `媒体下载失败，已降级为 URL 直传: ${url}`)
+        return h.video(url)
+      }
       if (mode === 'buffer') return h.video(buffer, 'video/mp4')
       if (mode === 'base64') return h.video(`data:video/mp4;base64,${buffer.toString('base64')}`)
       const file = await writeTempMedia(buffer, 'mp4')
@@ -932,24 +1321,33 @@ export function apply(ctx: Context, config: Config) {
   }
 
   // 批量翻译 markdown 链接文字（如 [SimBridge Guides] → simbridge指南），失败或行数不匹配时回退原文
-  async function translateLinkLabels(labels: string[]): Promise<Map<string, string>> {
+  async function translateLinkLabels(labels: string[], budgetMs?: number): Promise<Map<string, string>> {
     const map = new Map<string, string>()
     // 去重并跳过已含中文的文字（AI 译文中的 markdown 链接文字已是中文，无需再翻）
     const pending = [...new Set(labels.filter(l => l && !/[\u4e00-\u9fff]/.test(l)))]
-    if (!config.openaiApiKey || !pending.length) return map
+    // 主译文刚失败过（通道冷却中）时不要再白等一轮，链接文字直接保留原文
+    if (!config.openaiApiKey || !pending.length || !aiReady()) return map
+    const job = requestChat([
+      {
+        role: 'system',
+        content: '你是链接文字翻译器。把用户提供的每一行链接文字翻译成简体中文；按原行序输出，每行只输出一个译文，不要输出编号、引号或其他内容。专有名词（如 SimBridge、A32NX）可保留原文。',
+      },
+      { role: 'user', content: pending.join('\n') },
+    ])
+    job.catch(() => {})
     try {
-      const res: any = await postChatCompletion({
-        model: config.openaiModel,
-        messages: [
-          {
-            role: 'system',
-            content: '你是链接文字翻译器。把用户提供的每一行链接文字翻译成简体中文；按原行序输出，每行只输出一个译文，不要输出编号、引号或其他内容。专有名词（如 SimBridge、A32NX）可保留原文。',
-          },
-          { role: 'user', content: pending.join('\n') },
-        ],
-        temperature: 0.3,
-      })
-      const content = String(res?.choices?.[0]?.message?.content || '').trim()
+      let content: string | null = null
+      if (budgetMs && budgetMs > 0) {
+        const timeout = Symbol('timeout')
+        const raced = await Promise.race([
+          job,
+          new Promise<typeof timeout>(resolve => setTimeout(() => resolve(timeout), budgetMs)),
+        ])
+        content = raced === timeout ? null : raced
+        if (raced === timeout) ailog('warn', `链接文字翻译超过 ${Math.round(budgetMs / 1000)}s，保留原文`)
+      } else {
+        content = await job
+      }
       if (!content) return map
       const lines = content.split('\n').map(l => l.trim()).filter(Boolean)
       if (lines.length !== pending.length) return map
@@ -977,6 +1375,8 @@ export function apply(ctx: Context, config: Config) {
     return Math.min(0.95, Math.max(0.05, 1 - config.watermarkOpacity / 100))
   }
   async function addWatermark(buffer: Buffer, mime = 'image/png'): Promise<Buffer> {
+    // 水印文字为空时直接返回：省掉一次 puppeteer 往返（约 1~2s），推送更快
+    if (!String(config.watermarkText || '').trim()) return buffer
     const puppeteer = ctx.puppeteer
     if (!puppeteer) return buffer
     let page: any = null
@@ -1053,8 +1453,22 @@ export function apply(ctx: Context, config: Config) {
   const recentPushKeys = new Map<string, number>()
   const PUSH_DEDUP_WINDOW = 10 * 60 * 1000
 
-  // 上一条推送「发完」的时刻，用于保证消息之间至少间隔 pushMsgInterval 毫秒
-  let lastPushSentAt = 0
+  // 推送队列分道：'x' = X 推文轮询，'dc' = Discord 中转（实时事件 + 兜底轮询）
+  type PushLane = 'x' | 'dc'
+
+  // 上一条推送「发完」的时刻，用于保证消息之间至少间隔 pushMsgInterval 毫秒。
+  // 按来源分道：X 推文与 DC 中转各走一条队列，DC 实时消息不会被 X 的批量补发堵在后面。
+  const lastPushSentAt: Record<PushLane, number> = { x: 0, dc: 0 }
+
+  // 发送闸门：DC 实时事件可能在同一瞬间到达多条，若并发进入「等待间隔 → 发送」，
+  // 多批消息会同时外发（既失去防刷屏间隔，也可能乱序）。这里把真正的发送阶段串行排队。
+  const pushSlots: Record<PushLane, Promise<void>> = { x: Promise.resolve(), dc: Promise.resolve() }
+
+  function withPushSlot<T>(lane: PushLane, task: () => Promise<T>): Promise<T> {
+    const run = pushSlots[lane].then(task, task)
+    pushSlots[lane] = run.then(() => { }, () => { })
+    return run
+  }
 
   function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms))
@@ -1075,7 +1489,7 @@ export function apply(ctx: Context, config: Config) {
     return null
   }
 
-  async function push(account: string, source: string, text: string, link: string, pubDate: string, images: string[] = [], videos: string[] = [], gifs: string[] = [], pushTargets?: TargetConfig[], avatarUrl?: string, dedupId?: string): Promise<number> {
+  async function push(account: string, source: string, text: string, link: string, pubDate: string, images: string[] = [], videos: string[] = [], gifs: string[] = [], pushTargets?: TargetConfig[], avatarUrl?: string, dedupId?: string, lane: PushLane = 'x'): Promise<number> {
     // Discord 中转内容按频道归属推送板块，X 推文按账号归属；pushTargets 优先
     const targets = pushTargets?.length ? pushTargets : targetsFor(account)
     if (!targets.length) {
@@ -1088,7 +1502,18 @@ export function apply(ctx: Context, config: Config) {
     // 这里按内容指纹 + 目标群做窗口去重：优先取推文 ID，否则用归一化正文前缀。
     const contentKey = pushContentKey(account, text, link, dedupId)
 
-    const translated = await translate(text)
+    // 翻译、卡片图、链接文字翻译互相独立：并行执行，避免 DC 实时转发在多次串行 AI / 浏览器请求上白白等待。
+    // DC 实时通道给翻译加等待上限（dcTranslateBudgetMs）：AI 慢就先发原文，不让整条转发卡住。
+    const aiBudget = lane === 'dc' ? Math.max(1000, Number(config.dcTranslateBudgetMs) || 0) : undefined
+    const translatedPromise = translate(text, aiBudget)
+    const sourceLinkItems = extractLinkItems(text)
+    const linkLabelsPromise = translateLinkLabels(sourceLinkItems.map(i => i.label!).filter(Boolean), aiBudget)
+    // 推文卡片：默认本地渲染（不访问 x.com），因此不会再出现「正在进行安全验证」的截图
+    const screenshotPromise = link
+      ? captureTweetScreenshot(link, { account, author: `@${account}`, text, images, avatarUrl, pubDate, link })
+      : Promise.resolve(null)
+
+    const translated = await translatedPromise
 
     // 推送组装：
     // 1) 消息头部附带推文链接（linkStyle 决定原始 / fx / vx 形式）；
@@ -1099,10 +1524,16 @@ export function apply(ctx: Context, config: Config) {
     // 链接提取与清理同时覆盖原文和译文（AI 翻译会把链接文字翻译成中文并保留裸 URL）；
     // markdown 链接保留链接文字，翻译后拼进「原文链接」（如 simbridge指南：https://...）
     const linkItems = extractLinkItems(`${text}\n${translated || ''}`)
-    const linkLabelMap = await translateLinkLabels(linkItems.map(i => i.label!).filter(Boolean))
+    const linkLabelMap = await linkLabelsPromise
+    // 译文里新增的链接文字（一般已是中文，translateLinkLabels 会跳过）按需补翻
+    const pendingLabels = linkItems
+      .map(item => item.label!)
+      .filter(label => label && !/[\u4e00-\u9fff]/.test(label) && !linkLabelMap.has(label))
+    if (pendingLabels.length) {
+      const extra = await translateLinkLabels(pendingLabels, aiBudget)
+      for (const [label, value] of extra) linkLabelMap.set(label, value)
+    }
     const translatedClean = translated ? stripTweetLinks(removeUrls(translated)) : ''
-    const screenshot = link ? await captureTweetScreenshot(link) : null
-    const textCard = await renderTextCard(`@${account}`, bodyText, translatedClean, pubDate, avatarUrl)
 
     let mediaSkipped = 0
     const buildMediaSegments = async (): Promise<any[]> => {
@@ -1134,6 +1565,13 @@ export function apply(ctx: Context, config: Config) {
       return out
     }
 
+    // 文本卡片、媒体、截图水印同时准备（互不依赖）
+    const [textCard, mediaSegments, markedScreenshot] = await Promise.all([
+      renderTextCard(`@${account}`, bodyText, translatedClean, pubDate, avatarUrl),
+      buildMediaSegments(),
+      screenshotPromise.then(shot => shot ? addWatermark(shot, 'image/png') : null),
+    ])
+
     // 组装：头部链接（文字）→ 文本卡片图（原文+译文）→ 推文截图 → 媒体
     const segments: any[] = []
     if (link) segments.push(buildLink(link))
@@ -1149,11 +1587,10 @@ export function apply(ctx: Context, config: Config) {
       if (pubDate) lines.push('', `🕒 ${pubDate}`)
       segments.push(lines.join('\n'))
     }
-    if (screenshot) {
-      const marked = await addWatermark(screenshot, 'image/png')
-      segments.push(h.image(marked, 'image/png'))
+    if (markedScreenshot) {
+      segments.push(h.image(markedScreenshot, 'image/png'))
     }
-    segments.push(...await buildMediaSegments())
+    segments.push(...mediaSegments)
 
     // 原文包含的链接单独一条（正文里已移除，方便点击）；
     // markdown 链接显示为「翻译后的链接文字：URL」（如 [SimBridge Guides](url) → simbridge指南：url），
@@ -1196,66 +1633,70 @@ export function apply(ctx: Context, config: Config) {
     }
     if (!sendTargets.length) return 0
 
-    // 消息间隔：每条消息发送前先等待 pushMsgInterval 毫秒（进程启动后的第一条不等待），
-    // 保证相邻两条推送之间存在固定间隔，避免一轮轮询补发多条推文 / DC 连续多条消息时被判定为刷屏
-    if (msgInterval > 0 && lastPushSentAt > 0) {
-      plog('info', `推送间隔：等待 ${msgInterval}ms 后发送本条消息（防风控）`, account)
-      await sleep(msgInterval)
-      if (disposed) return 0
-    }
+    // 发送阶段串行排队（按 lane 分队列，X 与 DC 互不阻塞）：
+    // 消息间隔：每条消息发送前先等待 pushMsgInterval 毫秒（该队列的第一条不等待），
+    // 保证相邻两条推送之间存在固定间隔，避免轮询补发多条推文 / DC 连续多条消息时被判定为刷屏。
+    return withPushSlot(lane, async () => {
+      if (msgInterval > 0 && lastPushSentAt[lane] > 0) {
+        plog('info', `推送间隔：等待 ${msgInterval}ms 后发送本条消息（防风控）`, account)
+        await sleep(msgInterval)
+        if (disposed) return 0
+      }
 
-    let sent = 0
-    for (let offset = 0; offset < sendTargets.length; offset += batchSize) {
-      const batch = sendTargets.slice(offset, offset + batchSize)
-      const results = await Promise.all(batch.map(async (target) => {
-        // Status 是数字枚举（ONLINE = 1），与字符串 'online' 比较永远为 false
-        const bot = ctx.bots.find(b => b.platform === target.platform && (b.status as number) === 1) || ctx.bots.find(b => b.platform === target.platform)
-        if (!bot) {
-          plog('warn', `平台 ${target.platform} 没有可用机器人，无法推送到 ${target.channelId}`, account)
-          return 0
-        }
-        try {
-          let forwarded = false
-          if (config.pushAsForward) {
-            forwarded = await sendMergedForward(bot, target.channelId, segments.map(item => [item]))
+      let sent = 0
+      for (let offset = 0; offset < sendTargets.length; offset += batchSize) {
+        const batch = sendTargets.slice(offset, offset + batchSize)
+        const results = await Promise.all(batch.map(async (target) => {
+          // Status 是数字枚举（ONLINE = 1），与字符串 'online' 比较永远为 false
+          const bot = ctx.bots.find(b => b.platform === target.platform && (b.status as number) === 1) || ctx.bots.find(b => b.platform === target.platform)
+          if (!bot) {
+            plog('warn', `平台 ${target.platform} 没有可用机器人，无法推送到 ${target.channelId}`, account)
+            return 0
           }
-          if (!forwarded) await bot.sendMessage(target.channelId, segments)
-          if (contentKey) {
-            const dedupKey = `${contentKey}|${target.platform}:${target.channelId}`
-            recentPushKeys.set(dedupKey, Date.now())
-            if (recentPushKeys.size > 1000) {
-              const now = Date.now()
-              for (const [key, at] of recentPushKeys) {
-                if (now - at > PUSH_DEDUP_WINDOW) recentPushKeys.delete(key)
+          try {
+            let forwarded = false
+            if (config.pushAsForward) {
+              forwarded = await sendMergedForward(bot, target.channelId, segments.map(item => [item]))
+            }
+            if (!forwarded) await bot.sendMessage(target.channelId, segments)
+            if (contentKey) {
+              const dedupKey = `${contentKey}|${target.platform}:${target.channelId}`
+              recentPushKeys.set(dedupKey, Date.now())
+              if (recentPushKeys.size > 1000) {
+                const now = Date.now()
+                for (const [key, at] of recentPushKeys) {
+                  if (now - at > PUSH_DEDUP_WINDOW) recentPushKeys.delete(key)
+                }
               }
             }
-          }
-          if (config.notifySkippedMedia && mediaSkipped > 0) {
-            try {
-              await bot.sendMessage(target.channelId,
-                `⚠️ 本条推文有 ${mediaSkipped} 个媒体未能随消息发送（视频或图片加载失败），请前往原推文查看。`)
-            } catch (error: any) {
-              plog('warn', `发送媒体跳过说明失败: ${error?.message || error}`, account)
+            if (config.notifySkippedMedia && mediaSkipped > 0) {
+              try {
+                const hint = link ? `：${link}` : ''
+                await bot.sendMessage(target.channelId,
+                  `⚠️ 本条推文有 ${mediaSkipped} 个媒体未能随消息发送（视频或图片加载失败），请前往原推文查看${hint}`)
+              } catch (error: any) {
+                plog('warn', `发送媒体跳过说明失败: ${error?.message || error}`, account)
+              }
             }
+            return 1
+          } catch (error: any) {
+            plog('warn', `推送到 ${target.platform}:${target.channelId} 失败: ${error?.message || error}`, account)
+            return 0
           }
-          return 1
-        } catch (error: any) {
-          plog('warn', `推送到 ${target.platform}:${target.channelId} 失败: ${error?.message || error}`, account)
-          return 0
-        }
-      }))
-      sent += results.reduce((sum, value) => sum + value, 0)
-      // 批间延迟：最后一批之后不再等待；插件卸载时立即中止剩余批次
-      if (disposed) break
-      if (batchDelay > 0 && offset + batchSize < sendTargets.length) {
-        plog('info', `本批 ${batch.length} 个目标已发送，等待 ${batchDelay}ms 后继续（剩余 ${sendTargets.length - offset - batchSize} 个）`, account)
-        await sleep(batchDelay)
+        }))
+        sent += results.reduce((sum, value) => sum + value, 0)
+        // 批间延迟：最后一批之后不再等待；插件卸载时立即中止剩余批次
         if (disposed) break
+        if (batchDelay > 0 && offset + batchSize < sendTargets.length) {
+          plog('info', `本批 ${batch.length} 个目标已发送，等待 ${batchDelay}ms 后继续（剩余 ${sendTargets.length - offset - batchSize} 个）`, account)
+          await sleep(batchDelay)
+          if (disposed) break
+        }
       }
-    }
-    // 记录本条消息「发完」的时刻，供下一条消息计算最小间隔
-    lastPushSentAt = Date.now()
-    return sent
+      // 记录本条消息「发完」的时刻，供同队列的下一条消息计算最小间隔
+      lastPushSentAt[lane] = Date.now()
+      return sent
+    })
   }
 
   // ---------------- Rettiwt 模式（API_KEY 登录，固定使用此方式） ----------------
@@ -1388,40 +1829,93 @@ export function apply(ctx: Context, config: Config) {
   // rettiwt 的 GraphQL 时间线被 X 风控静默返回空时，用 Puppeteer 访问用户主页
   // 拿最新推文链接，再经 vxtwitter 解析正文与媒体，保证转发功能继续可用。
 
-  function decodeAuthTokenCookie(): string {
-    const raw = config.rettiwtApiKey.trim()
-    if (!raw) return ''
-    try {
-      return /^auth_token=/i.test(raw) ? raw : Buffer.from(raw, 'base64').toString('utf8')
-    } catch { return '' }
+  // 2026-10-20：浏览器回退被 Cloudflare Turnstile 拦截（x.com 对自动化环境强制人机验证），
+  // 带 auth_token 的请求（无论纯 HTTP 还是浏览器）会被 302 到 /account/access。
+  // 实测未登录（无 cookie）的纯 HTTP 请求可拿到完整 SSR 主页，页内嵌有最新数条推文的 status 链接，
+  // 据此新增 HTTP 直取路径作为首选，浏览器路径降级为兜底。
+
+  // 无 cookie 纯 HTTP 拉取未登录版主页，提取页内嵌的推文 ID（文档顺序）与头像。
+  // 偶发被 Cloudflare 判风险时会直接返回「正在进行安全验证」页（HTTP 200 但没推文），
+  // 这种情况下换一个 UA / 语言头立即重试一次通常就能过，而且必须明确报错，不能静默当成「没有新推文」。
+  const HTTP_FETCH_ATTEMPTS = [
+    {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36 Edg/155.0.0.0',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    },
+    {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+  ]
+
+  function looksLikeCloudflarePage(html: string): boolean {
+    return /Just a moment|正在进行安全验证|cf-chl|challenge-platform|Enable JavaScript and cookies/i.test(String(html || ''))
   }
 
-  function extractAuthToken(cookie: string): string {
-    return cookie.match(/auth_token=([^;]+)/i)?.[1] || ''
+  async function fetchLatestTweetIdsViaHttp(account: string): Promise<{ ids: string[]; avatar: string }> {
+    let lastHtml = ''
+    let lastError: any = null
+    for (let i = 0; i < HTTP_FETCH_ATTEMPTS.length; i++) {
+      try {
+        const html: any = await ctx.http.get(`https://x.com/${account}`, {
+          responseType: 'text',
+          timeout: config.requestTimeout,
+          headers: HTTP_FETCH_ATTEMPTS[i],
+        })
+        lastHtml = typeof html === 'string' ? html : String(html)
+        const ids: string[] = []
+        for (const m of lastHtml.matchAll(/status\/(\d{15,})/g)) {
+          if (!ids.includes(m[1])) ids.push(m[1])
+        }
+        if (ids.length) {
+          const avatar = lastHtml.match(/<meta property="og:image" content="([^"]+)"/)?.[1] || ''
+          return { ids, avatar }
+        }
+        if (looksLikeCloudflarePage(lastHtml)) {
+          lastError = new Error('x.com 返回了 Cloudflare「正在进行安全验证」页（HTTP 直取被拦截）')
+        } else {
+          lastError = new Error(`主页未包含任何推文链接（可能账号受保护/不存在，或 X 返回了精简页，长度 ${lastHtml.length}）`)
+        }
+      } catch (error: any) {
+        lastError = error
+      }
+      // 第一次失败后稍等再换 UA 重试，避免连续同 IP 同指纹请求
+      if (i === 0) await new Promise(resolve => setTimeout(resolve, 1200))
+    }
+    throw lastError || new Error('HTTP 直取失败')
   }
 
+  // 浏览器兜底：匿名访问用户主页。
+  // 2026-10-24：此前会给页面注入 auth_token，X 随即重定向到 /account/access 并弹出
+  // Cloudflare 人机验证，兜底路径必然失败；改为匿名访问后主页可以正常 SSR 出推文。
   async function fetchLatestTweetUrlViaBrowser(account: string): Promise<{ url: string; avatar: string } | null> {
     const puppeteer = (ctx as any).puppeteer
     if (!puppeteer?.page) return null
-    const authToken = extractAuthToken(decodeAuthTokenCookie())
     const page = await puppeteer.page()
     try {
-      if (authToken) {
-        await page.setCookie({ name: 'auth_token', value: authToken, domain: '.x.com', path: '/', httpOnly: true, secure: true })
+      await page.setViewport({ width: 720, height: 900 })
+      await page.setUserAgent(X_BROWSER_UA)
+      await page.setExtraHTTPHeaders({ 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' })
+      await page.goto(`https://x.com/${account}`, { waitUntil: 'domcontentloaded', timeout: 30000 })
+      const article = await page.waitForSelector('article', { timeout: 15000 })
+      const probe: any = await page.evaluate(() => ({
+        url: location.href,
+        title: document.title,
+        text: (document.body?.innerText || '').slice(0, 400),
+      }))
+      if (looksLikeXVerification(probe?.url, probe?.title, probe?.text)) {
+        throw new Error('X 要求进行安全验证（匿名访问仍被拦截）')
       }
-      await page.goto(`https://x.com/${account}`, { waitUntil: 'networkidle2', timeout: 30000 })
-      await page.waitForSelector('article[data-testid="tweet"]', { timeout: 20000 })
-      // 同时取最新推文链接与作者头像（头像 = 选中推文卡片内的 profile_images 图片，
-      // 对应主页时间线上第一条符合条件的推文，如 XPath .../article/.../a/div/img 所指）
+      // 同时取最新推文链接与作者头像（头像 = 选中推文卡片内的 profile_images 图片）
       const latest = await page.evaluate((noRt: boolean) => {
-        const articles = document.querySelectorAll('article[data-testid="tweet"]')
+        const articles = document.querySelectorAll('article')
         for (const article of articles) {
-          const socialContextEl = article.querySelector('[data-testid="socialContext"]')
-          if (socialContextEl) {
-            const contextText = socialContextEl.textContent || ''
-            if (/(pinned|已置顶|置顶|固定|置頂)/i.test(contextText)) continue
-            if (noRt && /(retweeted|reposted|retweet|repost|转推|轉推|转发|已转帖)/i.test(contextText)) continue
-          }
+          const articleText = (article as HTMLElement).innerText || ''
+          // X 已移除 data-testid="socialContext"，置顶/转推提示只能从卡片文本判断
+          if (/(pinned|已置顶|置顶|固定|置頂)/i.test(articleText.slice(0, 80))) continue
+          if (noRt && /^(reposted|retweeted|已转帖|转推|轉推|转发)/i.test(articleText.trim())) continue
           const link = article.querySelector('a[href*="/status/"]') as HTMLAnchorElement | null
           if (link) {
             const avatarEl = article.querySelector('img[src*="profile_images"]') as HTMLImageElement | null
@@ -1431,18 +1925,71 @@ export function apply(ctx: Context, config: Config) {
         return null
       }, config.excludeRetweets)
       return latest
+    } catch (error: any) {
+      xlog('warn', `浏览器兜底读取主页失败 @${account}: ${error?.message || error}`, account)
+      return null
     } finally {
       await page.close().catch(() => {})
     }
   }
 
+  // ---------------- 推文解析（fxtwitter 优先，vxtwitter 兜底） ----------------
+  //
+  // 2026-10-24：vxtwitter 接口在本机经常直接 403，fxtwitter 的 /status/<id> 返回结构化 JSON
+  // （text / media / author / created_at / reposted_by），无需登录也不会触发 Cloudflare，
+  // 因此改为 fxtwitter 优先、vxtwitter 兜底；两者都失败才回退浏览器抓主页。
+
+  function tweetIdFromUrl(tweetUrl: string): string {
+    return tweetUrl.match(/status\/(\d+)/)?.[1] || ''
+  }
+
+  async function fetchTweetViaFxTwitter(account: string, tweetId: string): Promise<RettiwtTweet | null> {
+    const apiUrl = `https://api.fxtwitter.com/${encodeURIComponent(account)}/status/${tweetId}`
+    const data: any = await ctx.http.get(apiUrl, {
+      headers: { 'User-Agent': X_BROWSER_UA, 'Accept': 'application/json' },
+      responseType: 'text',
+      timeout: config.requestTimeout,
+    })
+    const parsed: any = typeof data === 'string' ? JSON.parse(data) : data
+    const tweet = parsed?.tweet
+    if (!tweet || !tweet.text) return null
+    const images: string[] = []
+    const videos: string[] = []
+    const gifs: string[] = []
+    for (const item of (Array.isArray(tweet?.media?.all) ? tweet.media.all : [])) {
+      const type = String(item?.type || '').toLowerCase()
+      const url = String(item?.url || '')
+      if (!url) continue
+      if (type === 'photo' || type === 'image') images.push(url)
+      else if (type === 'gif') gifs.push(url)
+      else if (type === 'video') videos.push(url)
+    }
+    let text = String(tweet.text || '')
+    if (config.includeQuote && tweet?.quote?.text) {
+      text += `\n\n引用 @${tweet.quote.author?.screen_name || ''}: ${tweet.quote.text}`
+    }
+    return {
+      id: String(tweet.id || tweetId),
+      text,
+      images,
+      videos,
+      gifs,
+      author: String(tweet.author?.screen_name || account),
+      avatarUrl: String(tweet.author?.avatar_url || '') || undefined,
+      createdAt: String(tweet.created_at || (tweet.created_timestamp ? new Date(tweet.created_timestamp * 1000).toISOString() : '')),
+      // reposted_by 非空表示这是一条转推；文本 RT @ 前缀兜底
+      isRetweet: Boolean(tweet.reposted_by) || /^RT @/.test(String(tweet.text || '')),
+    }
+  }
+
   async function fetchTweetViaVxTwitter(account: string, tweetUrl: string): Promise<RettiwtTweet | null> {
-    const tweetId = tweetUrl.match(/status\/(\d+)/)?.[1]
+    const tweetId = tweetIdFromUrl(tweetUrl)
     if (!tweetId) return null
     const apiUrl = `https://api.vxtwitter.com/${account}/status/${tweetId}`
     const data: any = await ctx.http.get(apiUrl, {
-      headers: { 'User-Agent': 'Koishi-X-Relay-Monitor' },
+      headers: { 'User-Agent': X_BROWSER_UA, 'Accept': 'application/json' },
       responseType: 'text',
+      timeout: config.requestTimeout,
     })
     const parsed: any = typeof data === 'string' ? JSON.parse(data) : data
     if (!parsed || !parsed.text) return null
@@ -1464,35 +2011,88 @@ export function apply(ctx: Context, config: Config) {
       videos,
       gifs,
       author: String(parsed.user_screen_name || parsed.screen_name || account),
-      // vxtwitter 响应没有固定的头像字段，尝试多个候选；通常为空，头像由 rettiwt user.details 的 profileImage 兜底
+      // vxtwitter 响应含 user_profile_image_url（_normal 后缀）；为空时由主页 og:image 兜底
       avatarUrl: String(parsed.avatar_url || parsed.user_avatar_url || parsed.user_profile_image_url || parsed.profile_image_url || '') || undefined,
-      createdAt: String(parsed.created_at || parsed.createdAt || ''),
-      isRetweet: false,
+      // vxtwitter 用 date（Twitter 格式字符串）/ date_epoch（秒）字段，无 created_at
+      createdAt: String(parsed.created_at || parsed.createdAt
+        || (parsed.date_epoch ? new Date(parsed.date_epoch * 1000).toISOString() : '')
+        || parsed.date || ''),
+      // retweet 字段：普通推文为 null，转推为对象/真值；文本 RT @ 前缀兜底
+      isRetweet: Boolean(parsed.retweet) || /^RT @/.test(String(parsed.text || '')),
+    }
+  }
+
+  async function fetchTweetFromMirror(account: string, tweetUrl: string): Promise<RettiwtTweet | null> {
+    const tweetId = tweetIdFromUrl(tweetUrl)
+    if (!tweetId) return null
+    try {
+      const tweet = await fetchTweetViaFxTwitter(account, tweetId)
+      if (tweet) return tweet
+      xlog('info', `fxtwitter 未返回推文 ${tweetId}，尝试 vxtwitter`, account)
+    } catch (error: any) {
+      xlog('info', `fxtwitter 解析失败（${error?.message || error}），尝试 vxtwitter`, account)
+    }
+    try {
+      return await fetchTweetViaVxTwitter(account, tweetUrl)
+    } catch (error: any) {
+      xlog('warn', `vxtwitter 解析失败: ${error?.message || error}`, account)
+      return null
     }
   }
 
   async function pollAccountViaRettiwt(account: string): Promise<string> {
     // 说明：X 当前对非浏览器主页返回精简页，rettiwt 内部 x-client-transaction-id 无法解析
-    // ondemand chunk，主路径已整体失效（每次都抛 Unknown error）。因此这里直接走 Puppeteer
-    // 浏览器回退获取最新一条推文，避免无意义的失败重试与告警刷屏。
+    // ondemand chunk，主路径已整体失效（每次都抛 Unknown error）。
+    // 首选：无 cookie 纯 HTTP 拉未登录版主页提取推文 ID（2026-10-20 实测可用）；
+    // 兜底：Puppeteer 浏览器回退（2026-10-20 起常被 Cloudflare Turnstile 拦截，仅作备选）。
     let tweets: RettiwtTweet[] = []
     try {
-      const latest = await fetchLatestTweetUrlViaBrowser(account)
-      if (latest?.url) {
-        const tweet = await fetchTweetViaVxTwitter(account, latest.url)
-        if (tweet) {
-          tweet.avatarUrl = tweet.avatarUrl || latest.avatar || undefined
-          tweets = [tweet]
-          xlog('info', `已通过浏览器获取最新推文 ${tweet.id}`, account)
+      const { ids, avatar } = await fetchLatestTweetIdsViaHttp(account)
+      if (ids.length) {
+        // 雪花 ID 数值降序 = 时间降序；逐条经 fxtwitter / vxtwitter 解析正文与媒体
+        const sorted = [...new Set(ids)]
+          .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
+          .slice(0, Math.max(config.maxTweets, 5))
+        for (const id of sorted) {
+          try {
+            const tweet = await fetchTweetFromMirror(account, `https://x.com/${account}/status/${id}`)
+            if (!tweet) continue
+            tweet.avatarUrl = tweet.avatarUrl || avatar || undefined
+            tweets.push(tweet)
+          } catch { /* 单条解析失败不阻塞其余 */ }
         }
+        if (tweets.length) xlog('info', `已通过 HTTP 直取 ${tweets.length} 条推文（ID ${ids.length} 个）`, account)
       }
     } catch (error: any) {
-      xlog('warn', `浏览器获取失败: ${error?.message || error}`, account)
+      xlog('warn', `HTTP 直取失败: ${error?.message || error}`, account)
+    }
+    if (!tweets.length) {
+      // 浏览器回退默认关闭：x.com 对自动化环境经常直接弹「正在进行安全验证」，
+      // 这条路径现在只会白等 20~30 秒并刷警告；需要时可在配置里手动开启。
+      if (config.xBrowserFallback) {
+        try {
+          const latest = await fetchLatestTweetUrlViaBrowser(account)
+          if (latest?.url) {
+            const tweet = await fetchTweetFromMirror(account, latest.url)
+            if (tweet) {
+              tweet.avatarUrl = tweet.avatarUrl || latest.avatar || undefined
+              tweets = [tweet]
+              xlog('info', `已通过浏览器获取最新推文 ${tweet.id}`, account)
+            }
+          }
+        } catch (error: any) {
+          xlog('warn', `浏览器获取失败: ${error?.message || error}`, account)
+        }
+      } else {
+        xlog('warn', `HTTP 直取无结果（未启用浏览器回退）: ${account}`, account)
+      }
     }
     if (!tweets.length) return `${account}: 时间线为空或拉取失败`
 
     const candidates = tweets.filter(tweet => !config.excludeRetweets || !tweet.isRetweet)
-    const newest = candidates[0]?.id || tweets[0].id
+    // 水位线取「所有拉到的推文」中最新的 ID，而不是排除转推后的第一条：
+    // 否则最新一条恰好是转推时水位线会倒退，下一轮把旧推文重复推送一遍。
+    const newest = [...tweets].sort((a, b) => b.id.localeCompare(a.id, undefined, { numeric: true }))[0]?.id
     const last = lastIds[account]
     if (!last) {
       // 首次见到该账号：只记录基线，不补发历史
@@ -1501,15 +2101,33 @@ export function apply(ctx: Context, config: Config) {
       return `${account}: 首次采集，已记录基线 ${newest}（不补发历史）`
     }
 
-    // 时间线为最新在前；仅推送基线之后的新推文
-    const fresh = candidates.filter(tweet => tweet.id > last).sort((a, b) => a.id.localeCompare(b.id))
-    lastIds[account] = newest
+    // 时间线为最新在前；仅推送基线之后、且从未推送过的新推文
+    const fresh = candidates
+      .filter(tweet => tweet.id > last && !pushedTweetIds.has(tweet.id))
+      .sort((a, b) => a.id.localeCompare(b.id))
+    // 水位线只前进、不倒退：镜像接口（fxtwitter/vxtwitter）偶发解析失败时，成功解析的可能只剩
+    // 旧推文（主页返回的 5 个 ID 里含置顶推），若无条件回写会把水位线拉低，
+    // 下一轮「所有 ID 都大于水位线」→ 置顶旧推文整批重复推送（实测会跨天循环重推）。
+    if (newerSnowflake(newest, last)) {
+      lastIds[account] = newest
+    } else if (newest !== last) {
+      xlog('warn', `推文 ${account} 本轮解析到的最新 ID ${newest} 不大于水位线 ${last}（镜像解析部分失败），水位线保持不变（防重复推送）`, account)
+    }
     let sent = 0
     let pushed = 0
     for (const tweet of fresh) {
       if (!passesFilters(tweet.text)) continue
       pushed++
       sent += await push(account, `@${tweet.author}`, tweet.text, `https://x.com/${account}/status/${tweet.id}`, tweet.createdAt, tweet.images, tweet.videos, tweet.gifs, undefined, tweet.avatarUrl, tweet.id)
+      // 无论本次是否部分群失败都记为「已推送」：宁可少数群漏一条，也不能对同一条反复刷屏
+      pushedTweetIds.add(tweet.id)
+    }
+    if (pushed) {
+      while (pushedTweetIds.size > PUSHED_IDS_LIMIT) {
+        const oldest = pushedTweetIds.values().next().value
+        if (oldest == null) break
+        pushedTweetIds.delete(oldest)
+      }
     }
     await saveState()
     return `${account}: 新推文 ${fresh.length} 条（推送 ${pushed} 条），发送成功 ${sent} 群次`
@@ -1561,8 +2179,13 @@ export function apply(ctx: Context, config: Config) {
       return `${account}: 首次采集，已记录基线 ${newest}（${items.length} 条，不补发历史）`
     }
 
-    const fresh = items.filter(item => item.id > last)
-    lastIds[account] = newest
+    const fresh = items.filter(item => item.id > last && !pushedTweetIds.has(item.id))
+    // 水位线只前进、不倒退（与 HTTP 直取同理：源偶发只吐旧内容时防止整批重推）
+    if (newerSnowflake(newest, last)) {
+      lastIds[account] = newest
+    } else if (newest !== last) {
+      xlog('warn', `RSS ${account} 本轮最新 ID ${newest} 不大于水位线 ${last}，水位线保持不变（防重复推送）`)
+    }
     let sent = 0
     let pushed = 0
     for (const item of fresh) {
@@ -1573,6 +2196,14 @@ export function apply(ctx: Context, config: Config) {
       if (!passesFilters(item.text)) continue
       pushed++
       sent += await push(account, `@${account}`, item.text, item.link, item.pubDate, item.images, item.videos, undefined, undefined, undefined, item.id)
+      pushedTweetIds.add(item.id)
+    }
+    if (pushed) {
+      while (pushedTweetIds.size > PUSHED_IDS_LIMIT) {
+        const oldest = pushedTweetIds.values().next().value
+        if (oldest == null) break
+        pushedTweetIds.delete(oldest)
+      }
     }
     await saveState()
     return `${account}: 新内容 ${fresh.length} 条（推送 ${pushed} 条），发送成功 ${sent} 群次`
@@ -1584,12 +2215,14 @@ export function apply(ctx: Context, config: Config) {
       : pollAccountViaRettiwt(account)
   }
 
-  async function pollOnce(manual: boolean): Promise<string> {
-    if (polling) return '上一轮轮询尚未结束'
+  // X 轮询与 DC 兜底轮询各自独立、互不阻塞：
+  // 此前两者共用一个 polling 标志和 10 分钟定时器，X 侧任何慢请求（截图/翻译/接口超时）
+  // 都会把 DC 的读取整体推迟到下一轮，DC 消息因此可能延迟十几分钟。
+  async function pollXOnce(manual: boolean): Promise<string> {
+    if (xPolling) return '上一轮 X 轮询尚未结束'
     const accounts = allAccounts()
-    const discordChannels = allDiscordChannels()
-    if (!accounts.length && !(config.discordEnabled && discordChannels.length)) return '未配置 X 推送账号或 DC 推送频道'
-    polling = true
+    if (!accounts.length) return '未配置 X 推送账号'
+    xPolling = true
     const results: string[] = []
     try {
       for (const account of accounts) {
@@ -1601,24 +2234,44 @@ export function apply(ctx: Context, config: Config) {
           xlog('warn', `拉取 ${account} 失败: ${error?.message || error}`)
         }
       }
-      // 通过 DC 机器人读取推送板块内配置的中转频道内容
-      if (config.discordEnabled && discordChannels.length) {
-        try {
-          results.push(await pollDiscord())
-        } catch (error: any) {
-          results.push(`Discord 中转读取失败: ${error?.message || error}`)
-          dclog('warn', `Discord 中转读取失败: ${error?.message || error}`)
-        }
-      }
     } finally {
-      polling = false
+      xPolling = false
     }
     const summary = results.join('\n')
-    log('info', `轮询完成${manual ? '（手动）' : ''}:\n${summary}`)
+    log('info', `X 轮询完成${manual ? '（手动）' : ''}:\n${summary}`)
     return summary
   }
 
+  // DC 兜底轮询：只读取推送板块内配置的中转频道（实时消息由 discord/message-create 事件即时转发）
+  async function pollDiscordOnce(manual: boolean): Promise<string> {
+    if (dcPolling) return '上一轮 DC 轮询尚未结束'
+    if (!config.discordEnabled) return 'Discord 未启用'
+    if (!allDiscordChannels().length) return '推送板块内未配置有效的 DC 推送频道'
+    dcPolling = true
+    try {
+      const summary = await pollDiscord()
+      // 兜底轮询默认 15 秒一次，空轮不写日志，避免刷屏；有新增/失败才输出
+      if (manual || /(?:新消息 [1-9]|推送成功 [1-9]|失败|没有可用机器人|未找到 APP ID)/.test(summary)) {
+        dclog('info', `DC 轮询完成${manual ? '（手动）' : ''}:\n${summary}`)
+      }
+      return summary
+    } finally {
+      dcPolling = false
+    }
+  }
+
   // ---------------- Discord 中转（通过 DC 机器人读取指定频道内容） ----------------
+
+  // 雪花 ID（推文/消息）大小比较：正常是纯数字字符串，用 BigInt 精确比较；
+  // 出现非数字内容时退回长度 + 字典序（等长数字串下与数值序一致）。
+  function newerSnowflake(a?: string, b?: string): boolean {
+    const x = String(a ?? '').trim()
+    const y = String(b ?? '').trim()
+    if (!x) return false
+    if (!y) return true
+    if (/^\d+$/.test(x) && /^\d+$/.test(y)) return BigInt(x) > BigInt(y)
+    return x.length > y.length || (x.length === y.length && x > y)
+  }
 
   // 频道配置支持完整链接（discord.com/channels/服务器ID/频道ID）或纯频道 ID
   function extractDiscordChannelId(value: string): string | null {
@@ -1676,8 +2329,11 @@ export function apply(ctx: Context, config: Config) {
     // DC 中转的媒体（embed 配图 / 附件）按开关决定是否随消息附带
     const images = config.dcRelayMedia ? (media?.images ?? []) : []
     const videos = config.dcRelayMedia ? (media?.videos ?? []) : []
-    const sent = await push(account || authorName || `dc:${channelId}`, source, body, '', '', images, videos, [], boardTargets, undefined, messageId)
-    dclog('info', `Discord 中转内容已推送 ${sent} 群次${images.length || videos.length ? `（附带 ${images.length} 图 / ${videos.length} 视频）` : ''}`)
+    // DC 中转走独立的推送队列（lane='dc'）：既不会被 X 的批量补发堵住，
+    // 翻译也有等待上限，保证「消息到达 → 群内可见」的总体延迟可控。
+    const t0 = Date.now()
+    const sent = await push(account || authorName || `dc:${channelId}`, source, body, '', '', images, videos, [], boardTargets, undefined, messageId, 'dc')
+    dclog('info', `Discord 中转内容已推送 ${sent} 群次（用时 ${Date.now() - t0}ms）${images.length || videos.length ? `（附带 ${images.length} 图 / ${videos.length} 视频）` : ''}`)
     return sent
   }
 
@@ -1878,15 +2534,40 @@ export function apply(ctx: Context, config: Config) {
     }
 
     collected.sort((a, b) => String(a.id).localeCompare(String(b.id)))
+    const changed = maxId !== lastMessageIds[channelId] || collected.length > 0
     lastMessageIds[channelId] = maxId
     let sent = 0
     for (const message of collected) {
       // 回源 REST 补全内容：正文被截断的用 embed 完整标题/摘要补齐，并取出 embed 配图与附件媒体
       const media = await enrichDiscordMessage(bot, channelId, message)
+      const before = sent
+      const startedAt = Date.now()
       sent += await relayMessage(message, channelId, bot.selfId, true, media)
+      // 由「兜底轮询」而不是网关事件转发的消息：说明实时事件没收到（或机器人当时离线），
+      // 这里把「消息发布 → 群内可见」的耗时打出来，方便一眼判断延迟到底来自哪一段。
+      if (sent > before) {
+        const rawTs = typeof message?.createdAt === 'number' ? message.createdAt : Date.parse(String(message?.timestamp || ''))
+        if (Number.isFinite(rawTs) && rawTs > 0) {
+          const age = startedAt - rawTs
+          const note = age > 5000 ? '（实时事件未收到，本次为轮询补发）' : ''
+          dclog('info', `Discord 兜底轮询转发 ...${String(message.id).slice(-6)}：消息发布 → 群内可见 ${Math.max(0, age)}ms${note}`)
+        }
+      }
     }
-    await saveState()
+    // 兜底轮询 15 秒一次，无新消息时不写盘
+    if (changed) await saveState()
     return `Discord #${channelId}: 新消息 ${collected.length} 条，推送成功 ${sent} 群次`
+  }
+
+  // 判断「这个机器人是不是本插件要用的中转机器人」。
+  // 配置了 dcAppId 时优先只认它；但如果该 APP ID 对应的机器人根本没连上（token 失效 / 适配器停用），
+  // 就退化为放行所有 discord 机器人 —— 否则实时事件永远匹配不上，只能靠轮询，延迟被拉到轮询周期。
+  function isRelayBot(bot: any): boolean {
+    if (!bot || bot.platform !== 'discord') return false
+    const appId = String(config.dcAppId || '').trim()
+    if (!appId) return true
+    if (String(bot.selfId) === appId) return true
+    return !ctx.bots.some(b => b.platform === 'discord' && String(b.selfId) === appId)
   }
 
   async function pollDiscord(): Promise<string> {
@@ -1917,209 +2598,123 @@ export function apply(ctx: Context, config: Config) {
     return results.join('\n') || 'Discord 中转频道列表为空'
   }
 
-  // ---------------- Discord 实时推送（不等轮询周期） ----------------
-  // Discord 机器人在线时通过 message-created 事件即时中转新消息，收到即推；
-  // 定时轮询仍保留作为兜底（接收离线 / 事件错过期间的消息），discordSeen 去重避免重复推送。
-  ctx.on('message-created', async (session) => {
-    if (disposed || !config.discordEnabled) return
-    const bot = session.bot
-    if (!bot || bot.platform !== 'discord') return
-    // 固定使用配置的 DC 机器人（与轮询一致），其它机器人（如 DC-QQ 桥接）的频道事件不处理
-    if (config.dcAppId && String(bot.selfId) !== String(config.dcAppId)) {
-      dclog('info', `收到 Discord 消息事件，但机器人 selfId=${bot.selfId} 与配置的 dcAppId 不一致，忽略（频道 ${session.channelId}）`)
-      return
-    }
-    const channelId = String(session.channelId || '')
-    if (!allDiscordChannels().includes(channelId)) {
-      dclog('info', `Discord 消息 ...${String(session.messageId || '').slice(-6)} 来自未监听的频道 ${channelId}，忽略`)
-      return
-    }
-    const messageId = String(session.messageId || '')
-    if (!messageId || discordSeen.has(messageId)) return
-    // 跳过机器人自身消息
-    if (String(session.userId || '') === String(bot.selfId)) return
-    dclog('info', `Discord 实时消息到达：频道 ${channelId}，消息 ...${messageId.slice(-6)}，作者 ${session.userId}`)
+  // ---------------- Discord 实时推送（gateway 原始事件，不等轮询） ----------------
+  //
+  // 直接监听 satori Discord 适配器派发的 discord/message-create 原始事件，而不是上层
+  // message-created session：当消息是「回复 / 转发」且机器人无权读取被引用消息时，
+  // 适配器的 decodeMessage 会抛 403 Missing Access 并丢弃整个 session，导致实时转发从未触发，
+  // 只能等 10 分钟一次的轮询。原始事件在 decodeMessage 之前派发，字段（content / embeds /
+  // attachments / message_reference）完整，既不丢消息也不受适配器解析失败影响。
+  //
+  // 兜底轮询仍然保留（默认 15 秒），用于 webhook 事件漏收 / 机器人短暂离线期间补收；
+  // discordSeen 去重保证同一条消息只会推送一次。
 
-    // Discord 系统消息处理：API 的 content 不含客户端显示的完整文案（如频道跟随提示
-    // 「XX 将 YY 加入了此频道」只有 YY），按消息类型拼装完整文案后再推送
-    const rawD: any = (session as any).discord?.d || {}
-    const rawType = Number(rawD.type ?? 0)
-    let preText = ''
-    if (rawType === 12) {
-      // 频道跟随提示：content 为被加入的频道名，按客户端样式拼装
-      const follower = String(rawD.author?.username || session.username || session.userId || '有人')
-      preText = `${follower} 将「${String(rawD.content || '').trim()}」加入了此频道，最重要的更新都将显示在这里。`
-      dclog('info', `Discord 频道跟随系统消息，已拼装完整文案（${preText.length} 字）`)
-    } else if (rawType !== 0) {
-      dclog('info', `跳过 Discord 系统消息（type=${rawType}，无实质正文）`)
-      return
-    }
+  function trimDiscordSeen() {
+    if (discordSeen.size <= 400) return
+    for (const id of [...discordSeen].slice(0, 200)) discordSeen.delete(id)
+  }
 
-    // 从事件元素中提取文本 / 图片 / 视频
-    // 注意：Discord 消息里的 <https://...> 链接会被 h.parse 误解析为未知容器元素，
-    // img/at 等真实元素可能嵌套其中 —— 必须递归提取，绝不能把元素 toString 塞进正文
-    //（否则序列化标记会混入文本，发送时被再次解析成图片/@消息段，造成内容错乱）
-    const textParts: string[] = []
-    const images: string[] = []
-    const videos: string[] = []
-    // 跨发（crosspost）/引用消息的原文可能被 satori 包进 quote 元素，单独收集作为兜底
-    const quoteParts: string[] = []
-    const quoteImages: string[] = []
-    const collectElements = (el: any, texts: string[], imgs: string[], vids: string[]): void => {
-      if (!el || typeof el !== 'object') return
-      const type = String(el.type || '')
-      if (type === 'text') {
-        texts.push(String(el.attrs?.content ?? ''))
-        return
-      }
-      if (type === 'img' || type === 'image') {
-        const src = String(el.attrs?.src || el.attrs?.url || '')
-        if (src) imgs.push(src)
-        return
-      }
-      if (type === 'video') {
-        const src = String(el.attrs?.src || el.attrs?.url || '')
-        if (src) vids.push(src)
-        return
-      }
-      if (type === 'face' || type === 'at' || type === 'sharp' || type === 'author') return
-      // 未知容器元素（如被误解析的 <https://...> 链接）：递归提取子元素，不输出序列化串
-      for (const child of el.children ?? []) collectElements(child, texts, imgs, vids)
-    }
-    for (const el of session.elements ?? []) {
-      const type = String(el.type || '')
-      if (type === 'quote') {
-        for (const child of el.children ?? []) collectElements(child, quoteParts, quoteImages, videos)
-      } else {
-        collectElements(el, textParts, images, videos)
-      }
-    }
-    let text = preText || textParts.join('').trim()
-    let images2 = images
-    // 正文为空但引用里有内容（公告跨发的常见形态）→ 使用引用内容作为正文
-    if (!text && !images2.length && (quoteParts.join('').trim() || quoteImages.length)) {
-      text = quoteParts.join('').trim()
-      images2 = [...quoteImages, ...images]
-    }
-    // 需要回源 REST 的三种情况：
-    // ① 正文为空（embed 公告）；② 正文被公告 Bot 自己截断成「标题...」（完整标题/摘要/配图都在 embed 里）；
-    // ③ 事件元素没解出任何媒体，但 gateway 原始数据表明这条消息带附件 / embed（否则配图会丢）
-    const gatewayAttachments = Array.isArray(rawD.attachments) ? rawD.attachments.length : 0
-    const gatewayEmbeds = Array.isArray(rawD.embeds) ? rawD.embeds.length : 0
-    if (needsEmbedLookup(text) || (!images2.length && (gatewayAttachments > 0 || gatewayEmbeds > 0))) {
-      dclog('info', `Discord 实时消息 ...${messageId.slice(-6)} 正文为空/被截断或媒体缺失，尝试回源 REST 获取原始消息...`)
-      try {
-        const raw: any = await bot.internal.getChannelMessage(channelId, messageId)
-        dclog('info', `回源 REST 响应：content ${String(raw?.content ?? '').length} 字、embeds ${Array.isArray(raw?.embeds) ? raw.embeds.length : 0} 条、attachments ${Array.isArray(raw?.attachments) ? raw.attachments.length : 0} 个`)
-        if (raw) {
-          const rawText = String(raw.content || '').trim()
-          if (!text && rawText) {
-            text = rawText
-            dclog('info', `Discord 实时消息 ...${messageId.slice(-6)} 已回源 REST 取得正文（${text.length} 字）`)
-          }
-          // embed 的标题 / 摘要 / 字段并入正文（正文已有的不重复添加）
-          const shell: any = { content: text }
-          const embedMedia = mergeDiscordEmbeds(shell, Array.isArray(raw.embeds) ? raw.embeds : [])
-          if (String(shell.content || '').trim().length > text.trim().length) {
-            const added = String(shell.content).trim().length - text.trim().length
-            text = String(shell.content).trim()
-            dclog('info', `Discord 实时消息 ...${messageId.slice(-6)} 已用 embed 补全正文（新增 ${added} 字）`)
-          }
-          if (!images2.length) {
-            // embed 配图 + 附件图片/视频
-            images2.push(...embedMedia.images)
-            const attachment = collectAttachmentMedia(raw.attachments)
-            images2.push(...attachment.images)
-            videos.push(...attachment.videos)
-          }
-          // Discord「转发」消息：本体 content 为空，只有 message_reference 指回原消息
-          const ref = raw.message_reference
-          if (!text && ref?.message_id) {
-            const refChannelId = String(ref.channel_id || channelId)
-            try {
-              const orig: any = await bot.internal.getChannelMessage(refChannelId, String(ref.message_id))
-              const origEmbedText = (Array.isArray(orig?.embeds) ? orig.embeds : [])
-                .map((e: any) => [String(e.title || '').trim(), String(e.description || '').trim()]
-                  .filter(Boolean).join('\n'))
-                .filter(Boolean).join('\n\n')
-              text = String(orig?.content || '').trim() || origEmbedText
-              if (!images2.length) {
-                for (const e of (Array.isArray(orig?.embeds) ? orig.embeds : [])) {
-                  const src = String(e.image?.url || e.thumbnail?.url || '')
-                  if (src) images2.push(src)
-                }
-                for (const a of (Array.isArray(orig?.attachments) ? orig.attachments : [])) {
-                  const type = String(a.content_type || '')
-                  const src = String(a.url || '')
-                  if (!src) continue
-                  if (type.startsWith('image/')) images2.push(src)
-                  else if (type.startsWith('video/')) videos.push(src)
-                }
-              }
-              if (text) {
-                dclog('info', `Discord 实时消息 ...${messageId.slice(-6)} 为转发消息，已从原消息取得正文（${text.length} 字）`)
-              } else {
-                dclog('warn', `Discord 转发消息 ...${messageId.slice(-6)} 的原消息（频道 ${refChannelId}）也没有可提取的正文`)
-              }
-            } catch (error: any) {
-              // 降级：原内容不可得（bot 无原频道权限），推送占位说明 + 原消息直链
-              dclog('warn', `Discord 转发消息 ...${messageId.slice(-6)} 的原内容读取失败（原频道 ${refChannelId}，bot 可能无权访问该频道）：${error?.message || error}，已降级为链接推送`)
-              const refGuildId = String(raw?.message_reference?.guild_id || '')
-              text = `📎 该消息为 Discord「转发」，正文不随消息传输且机器人无权读取原频道，请点开链接在 Discord 查看：\nhttps://discord.com/channels/${refGuildId}/${refChannelId}/${String(ref?.message_id || '')}`
-            }
-          }
-        }
-      } catch (error: any) {
-        dclog('warn', `Discord 实时消息 ...${messageId.slice(-6)} 回源 REST 失败：${error?.message || error}`)
-      }
-    }
-    if (!text && !images2.length) {
-      const rawInfo = (() => {
-        try {
-          const d = (session as any)?.discord?.d
-          return d ? `gateway原始：content ${String(d.content ?? '').length} 字、embeds ${Array.isArray(d.embeds) ? d.embeds.length : 0} 条、attachments ${Array.isArray(d.attachments) ? d.attachments.length : 0} 个、webhook_id=${d.webhook_id ?? '无'}` : 'session.discord 原始数据不可用'
-        } catch { return '原始数据读取失败' }
-      })()
-      dclog('warn', `Discord 实时消息 ...${messageId.slice(-6)} 无有效正文与媒体，跳过。元素类型=[${(session.elements ?? []).map(el => String(el.type || '')).join(',') || '（无元素）'}]，${rawInfo}`)
-      return
-    }
-
-    // 记入去重集合（正式轮询读到同一条消息时会跳过）
-    discordSeen.add(messageId)
-    if (discordSeen.size > 400) {
-      for (const id of [...discordSeen].slice(0, 200)) discordSeen.delete(id)
-    }
-
-    if (config.excludeRetweets && /^RT @/.test(text)) {
-      dclog('info', `跳过 Discord 实时消息 ...${messageId.slice(-6)}：命中排除转推`)
-      return
-    }
-    if (!passesFilters(text)) {
-      dclog('info', `跳过 Discord 实时消息 ...${messageId.slice(-6)}：命中包含/排除过滤`)
-      return
-    }
-
-    const authorName = String(session.author?.username || session.username || '')
-    const account = extractTwitterAccount(text)
-    const source = account ? `@${account}（Discord 中转）` : authorName ? `@${authorName}（Discord 中转）` : `Discord 中转 #${channelId}`
-    const boardTargets = targetsFor(undefined, channelId)
-    if (!boardTargets.length) {
-      dclog('warn', `Discord 实时消息 ${messageId} 所在频道 ${channelId} 未匹配到任何推送目标（请确认该频道已加入 XP/MFS 板块的「DC 推送频道」）`)
-      return
-    }
-    dclog('info', `开始推送 Discord 实时消息 ...${messageId.slice(-6)}：正文 ${text.length} 字、图 ${images2.length}、视频 ${videos.length}，目标 ${boardTargets.length} 个`)
-    // DC 中转的媒体按开关决定是否随消息附带；正文里残留的 emoji 短代码一并转成真 emoji
-    const relayText = cleanDiscordText(text)
-    const relayImages = config.dcRelayMedia ? images2 : []
-    const relayVideos = config.dcRelayMedia ? videos : []
+  // 事件名不在 Koishi 的事件类型表里（由 discord 适配器的 internal 会话派发），用 any 绕过类型校验
+  ctx.on('discord/message-create' as any, async (data: any, bot: any) => {
     try {
-      const sent = await push(account || authorName || `dc:${channelId}`, source, relayText, '', '', relayImages, relayVideos, [], boardTargets, undefined, messageId)
-      dclog('info', `Discord 实时消息已推送 ${sent} 群次（频道 ${channelId}，消息 ...${messageId.slice(-6)}）`)
+      if (disposed || !config.discordEnabled) return
+      if (!bot || bot.platform !== 'discord') return
+      // 固定使用配置的 DC 机器人（与轮询一致），其它机器人（如 DC-QQ 桥接）的频道事件不处理。
+      // 例外：配置的 APP ID 对应的机器人根本没连上时，退化为「谁收到就用谁」，避免实时转发整条失效
+      // （此前这种不一致会导致只能靠轮询转发，延迟被拉到轮询周期）。
+      if (!isRelayBot(bot)) {
+        const evtChannel = String(data?.channel_id || '')
+        if (evtChannel && allDiscordChannels().includes(evtChannel)) {
+          dclog('warn', `中转频道的实时事件来自机器人 ${bot.selfId}，与配置的 DC 机器人 ${config.dcAppId} 不一致，已忽略`)
+        }
+        return
+      }
+      const channelId = String(data?.channel_id || '')
+      if (!channelId || !allDiscordChannels().includes(channelId)) return
+      const messageId = String(data?.id || '')
+      if (!messageId) return
+
+      // Discord 原始时间戳 → 网关事件延迟（一般 <1s；若经常偏大说明网关事件不稳）
+      const rawType = Number(data.type ?? 0)
+      const sentAt = Number(data.timestamp) ? Date.parse(String(data.timestamp)) : 0
+      const gatewayLag = sentAt ? Date.now() - sentAt : null
+      const isSelf = String(data.author?.id || '') === String(bot.selfId)
+      // 到达日志放在「自身消息过滤」之前：这样即使只是机器人自己发消息，也能确认网关事件链路是通的
+      dclog('info', `Discord 网关收到消息：频道 ${channelId}，消息 ...${messageId.slice(-6)}，作者 ${data.author?.id}，type=${rawType}，embeds=${Array.isArray(data.embeds) ? data.embeds.length : 0}，attachments=${Array.isArray(data.attachments) ? data.attachments.length : 0}${gatewayLag != null ? `，网关延迟 ${Math.max(0, gatewayLag)}ms` : ''}${isSelf ? '（本机器人自己发出，跳过转发）' : ''}`)
+
+      // 跳过机器人自身消息（本插件推送出去的内容）
+      if (isSelf) return
+      if (discordSeen.has(messageId)) return
+      // 先占位，避免与兜底轮询同时处理同一条消息
+      discordSeen.add(messageId)
+      trimDiscordSeen()
+
+      // 0=普通消息 12=频道跟随系统消息 19=回复；其余系统消息没有可转发的正文
+      if (rawType !== 0 && rawType !== 12 && rawType !== 19) {
+        dclog('info', `跳过 Discord 系统消息（type=${rawType}，无实质正文）`)
+        return
+      }
+      const arrivedAt = Date.now()
+
+      // 统一包装成 relayMessage 需要的 message 结构（content / author / type）
+      const message: any = {
+        id: messageId,
+        content: String(data.content || ''),
+        author: data.author,
+        type: rawType,
+      }
+      if (rawType === 12) {
+        const follower = String(data.author?.username || data.author?.global_name || '有人')
+        message.content = `${follower} 将「${String(data.content || '').trim()}」加入了此频道，最重要的更新都将显示在这里。`
+        dclog('info', 'Discord 频道跟随系统消息，已拼装完整文案')
+      }
+
+      // gateway 原始数据已包含 embed / 附件：直接并入正文并收集媒体，无需再回源 REST
+      const media: DiscordRawMedia = mergeDiscordEmbeds(message, Array.isArray(data.embeds) ? data.embeds : [])
+      const attachment = collectAttachmentMedia(data.attachments)
+      media.images.push(...attachment.images)
+      media.videos.push(...attachment.videos)
+
+      // 转发消息/回复：本体 content 为空时，从被引用的原消息取正文与媒体
+      const ref = data.message_reference
+      if (!String(message.content || '').trim() && ref?.message_id) {
+        const refChannelId = String(ref.channel_id || channelId)
+        try {
+          if (typeof bot.internal?.getChannelMessage !== 'function') throw new Error('当前 Discord 适配器不支持读取单条消息')
+          const orig: any = await bot.internal.getChannelMessage(refChannelId, String(ref.message_id))
+          if (orig) {
+            const origMedia = mergeDiscordEmbeds(message, Array.isArray(orig.embeds) ? orig.embeds : [])
+            if (!String(message.content || '').trim() && String(orig.content || '').trim()) {
+              message.content = String(orig.content).trim()
+            }
+            media.images.push(...origMedia.images)
+            const origAttachment = collectAttachmentMedia(orig.attachments)
+            media.images.push(...origAttachment.images)
+            media.videos.push(...origAttachment.videos)
+            dclog('info', `Discord 转发/回复消息 ...${messageId.slice(-6)} 已从原消息取得内容（${String(message.content || '').length} 字）`)
+          }
+        } catch (error: any) {
+          // 降级：原内容不可得（bot 无原频道权限），推送占位说明 + 原消息直链
+          dclog('warn', `Discord 转发消息 ...${messageId.slice(-6)} 的原内容读取失败（原频道 ${refChannelId}）：${error?.message || error}，已降级为链接推送`)
+          message.content = `📎 该消息为 Discord「转发」，正文不随消息传输且机器人无权读取原频道，请点开链接在 Discord 查看：\nhttps://discord.com/channels/${String(ref.guild_id || data.guild_id || '')}/${refChannelId}/${String(ref.message_id)}`
+        }
+      }
+
+      if (!String(message.content || '').trim() && !media.images.length && !media.videos.length) {
+        dclog('warn', `Discord 实时消息 ...${messageId.slice(-6)} 无有效正文与媒体，跳过`)
+        return
+      }
+
+      // relayMessage 内部会做转推/过滤/目标归属判断并推送；消息 ID 已提前占位，这里 markSeen=false
+      const sent = await relayMessage(message, channelId, bot.selfId, false, media)
+      if (sent > 0) {
+        const total = gatewayLag != null ? Math.max(0, gatewayLag) + (Date.now() - arrivedAt) : Date.now() - arrivedAt
+        dclog('info', `Discord 实时消息已推送 ${sent} 群次（频道 ${channelId}，消息 ...${messageId.slice(-6)}，消息发布→群内可见 ${total}ms）`)
+      }
     } catch (error: any) {
-      dclog('warn', `Discord 实时消息推送失败: ${error?.message || error}`)
+      dclog('warn', `Discord 实时消息处理失败: ${error?.message || error}`)
     }
   })
-
   // ---------------- 在线获取可用模型 ----------------
 
   async function refreshModels(): Promise<string[] | null> {
@@ -2363,29 +2958,45 @@ export function apply(ctx: Context, config: Config) {
           return lines.join('\n')
         }
 
-        // 2. API_KEY 格式已校验通过；rettiwt 主路径因 X 反爬已失效，不再用它做网络校验，
-        //    下面直接走浏览器回退验证账号可达性（与正式推送通道一致）。
+        // 2. API_KEY 格式已校验通过；rettiwt 主路径因 X 反爬已失效，实际抓取走
+        //    「未登录主页取推文 ID → fxtwitter / vxtwitter 解析」，与正式推送通道一致。
         let avatarFallback: string | undefined
-        lines.push('✓ API_KEY 格式有效（rettiwt 主路径已因 X 反爬失效，实际抓取走浏览器回退）。')
+        lines.push('✓ API_KEY 格式有效（rettiwt 主路径已失效，实际抓取走匿名主页 + fxtwitter/vxtwitter）。')
 
-        // 4. 浏览器回退获取最新一条推文（与推送实际可用的通道一致），并取作者头像
+        // 4. 获取最新一条推文：HTTP 直取优先，浏览器匿名回退
         let tweet: RettiwtTweet | null = null
         let browserAvatar = ''
         try {
-          const latest = await fetchLatestTweetUrlViaBrowser(target)
-          if (!latest?.url) {
-            lines.push('✘ 浏览器回退未能获取到最新推文（请确认服务器可访问 x.com 且 Puppeteer 服务可用）。')
-            return lines.join('\n')
-          }
-          browserAvatar = latest.avatar || ''
-          tweet = await fetchTweetViaVxTwitter(target, latest.url)
-          if (!tweet) {
-            lines.push('✘ 浏览器回退拿到了推文链接，但 vxtwitter 解析失败。')
-            return lines.join('\n')
+          const { ids, avatar: httpAvatar } = await fetchLatestTweetIdsViaHttp(target)
+          if (ids.length) {
+            const newest = [...ids].sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0]
+            tweet = await fetchTweetFromMirror(target, `https://x.com/${target}/status/${newest}`)
+            browserAvatar = tweet?.avatarUrl || httpAvatar || ''
           }
         } catch (error: any) {
-          lines.push(`✘ 浏览器回退失败：${error?.message || error}`)
-          return lines.join('\n')
+          lines.push(`⚠ HTTP 直取失败：${error?.message || error}，尝试浏览器回退...`)
+        }
+        if (!tweet) {
+          if (!config.xBrowserFallback) {
+            lines.push('✘ 未能获取到最新推文（HTTP 直取无结果；浏览器回退已在配置中关闭）')
+            return lines.join('\n')
+          }
+          try {
+            const latest = await fetchLatestTweetUrlViaBrowser(target)
+            if (!latest?.url) {
+              lines.push('✘ 未能获取到最新推文（请确认服务器可访问 x.com，且 Puppeteer 服务可用）。')
+              return lines.join('\n')
+            }
+            browserAvatar = latest.avatar || browserAvatar || ''
+            tweet = await fetchTweetFromMirror(target, latest.url)
+            if (!tweet) {
+              lines.push('✘ 拿到了推文链接，但 fxtwitter / vxtwitter 均解析失败。')
+              return lines.join('\n')
+            }
+          } catch (error: any) {
+            lines.push(`✘ 浏览器回退失败：${error?.message || error}`)
+            return lines.join('\n')
+          }
         }
 
         // 5. 按推送版式组装并发送：
@@ -2410,7 +3021,15 @@ export function apply(ctx: Context, config: Config) {
         }
 
         const tweetUrl = `https://x.com/${target}/status/${tweet.id}`
-        const screenshot = await captureTweetScreenshot(tweetUrl)
+        const screenshot = await captureTweetScreenshot(tweetUrl, {
+          account: target,
+          author: `@${tweet.author || target}`,
+          text: bodyText,
+          images: tweet.images,
+          avatarUrl: tweet.avatarUrl || browserAvatar || avatarFallback,
+          pubDate,
+          link: tweetUrl,
+        })
         if (screenshot) parts.push(h.image(screenshot, 'image/png'))
 
         // 静态图片始终单独发送，与截图并存
@@ -2449,15 +3068,38 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.on('ready', () => {
     log('info', `插件启动: 模式 ${config.sourceMode}, X 推送账号 ${allAccounts().length} 个, DC 推送频道 ${allDiscordChannels().length} 个, 全局推送目标 ${flattenTargetGroups(config.targets).length} 个`)
+    // DC 机器人一致性检查：配置的 APP ID 没连上时，实时事件只能退化为「谁收到用谁」，
+    // 这种情况一定伴随实时转发异常，启动阶段就提示出来，免得再去日志里翻。
+    if (config.discordEnabled && allDiscordChannels().length) {
+      const bots = ctx.bots.filter(b => b.platform === 'discord')
+      if (!bots.length) {
+        dclog('warn', '没有已连接的 Discord 机器人，DC 中转只能靠 REST 轮询（请检查 adapter-discord 配置）')
+      } else if (config.dcAppId && !bots.some(b => String(b.selfId) === String(config.dcAppId))) {
+        dclog('warn', `配置的 DC 机器人 ${config.dcAppId} 未连接；当前已连接：${bots.map(b => b.selfId).join(', ')}。实时转发将使用实际连接的机器人，兜底轮询照旧`)
+      } else {
+        dclog('info', `DC 实时转发就绪：机器人 ${bots.map(b => b.selfId).join(', ')}，优先匹配 ${config.dcAppId || '（未指定）'}`)
+      }
+    }
     // 模型名作为变量：根据配置的 API KEY 与地址在线获取可用模型，重建面板下拉选项
     refreshModels().catch(() => {})
     loadState().then(() => {
-      const discordActive = config.discordEnabled && allDiscordChannels().length > 0
-      if (!config.xEnabled && !discordActive) return
-      const interval = Math.max(1, config.intervalMinutes) * 60 * 1000
-      timers.set('x-poll', setInterval(() => { if (!disposed) pollOnce(false).catch(() => {}) }, interval))
-      // 启动后 15 秒执行首轮采集
-      timers.set('x-first', setTimeout(() => { if (!disposed) pollOnce(false).catch(() => {}) }, 15000))
+      // X 与 DC 使用各自独立的定时器与重入锁：X 轮询再慢也不会推迟 DC 实时/兜底读取
+      const xActive = config.xEnabled && allAccounts().length > 0
+      const dcActive = config.discordEnabled && allDiscordChannels().length > 0
+      if (xActive) {
+        const interval = Math.max(1, config.intervalMinutes) * 60 * 1000
+        timers.set('x-poll', setInterval(() => { if (!disposed) pollXOnce(false).catch(() => {}) }, interval))
+        // 启动后 15 秒执行首轮 X 采集
+        timers.set('x-first', setTimeout(() => { if (!disposed) pollXOnce(false).catch(() => {}) }, 15000))
+      }
+      if (dcActive) {
+        // 兜底轮询默认 15 秒：实时消息由 discord/message-create 事件即时转发，
+        // 这里只负责补收事件漏掉的消息，不再等 X 的 10 分钟周期
+        const dcInterval = Math.max(5, Number(config.dcIntervalSeconds) || 15) * 1000
+        timers.set('dc-poll', setInterval(() => { if (!disposed) pollDiscordOnce(false).catch(() => {}) }, dcInterval))
+        // 启动后 5 秒执行首轮 DC 兜底读取
+        timers.set('dc-first', setTimeout(() => { if (!disposed) pollDiscordOnce(false).catch(() => {}) }, 5000))
+      }
     }).catch(() => {})
   })
 
